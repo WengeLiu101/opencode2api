@@ -29,14 +29,14 @@
   --font-mono:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 
-  --fs-xs: 12px;
-  --fs-sm: 13px;
-  --fs-base: 14px;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
   --fs-lg: 16px;
   --fs-2xl: 24px;
   --fs-3xl: 30px;
 
-  --lh-base: 1.6;
+  --lh-base: 1.5;
 
   --sp-1: 4px;
   --sp-2: 8px;

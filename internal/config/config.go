@@ -41,8 +41,12 @@ type Config struct {
 	WebUI             WebUIConfig                  `json:"webui"`
 	Prefer            Tier                         `json:"prefer"`
 	Reasoning         ReasoningConfig              `json:"reasoning"`
+	ProxyPool         ProxyPoolConfig              `json:"proxy_pool"`
 
 	effectiveProxies []string
+	// fallbackProxies holds the resolved ProxyPool.FallbackProxyFile entries
+	// (never overlapping effectiveProxies). Empty when no fallback tier is set.
+	fallbackProxies []string
 }
 
 // ReasoningConfig forces a thinking level for requests that do not state one.
@@ -196,6 +200,212 @@ type PerformanceConfig struct {
 	FreeTierBlockSeconds int `json:"free_tier_block_seconds"`
 }
 
+// ProxyPoolConfig tunes the proxy-pool manager: how often every proxy is
+// re-probed, how aggressively it is probed, the latency bands used for tiered
+// selection, and when a repeatedly failing proxy is temporarily disabled or
+// permanently retired.
+type ProxyPoolConfig struct {
+	// HealthMode selects how proxies are checked:
+	//   "rolling" (default) — probe a small rotating batch every
+	//      HealthTickSeconds, so checks stay spread out and never run as a burst.
+	//   "sweep" — probe the whole pool every HealthIntervalSeconds.
+	HealthMode string `json:"health_mode"`
+	// HealthTickSeconds is the rolling batch cadence.
+	HealthTickSeconds int `json:"health_tick_seconds"`
+	// HealthBatchSize is how many proxies each rolling tick probes.
+	HealthBatchSize int `json:"health_batch_size"`
+	// HealthIntervalSeconds is the full-sweep cadence (mode "sweep"): every proxy
+	// is probed once per interval (not only the currently-unhealthy ones). 0
+	// disables the periodic sweep, keeping the original "only recheck unhealthy"
+	// behavior.
+	HealthIntervalSeconds int `json:"health_interval_seconds"`
+	// HealthConcurrency caps how many proxy probes run at once during a sweep.
+	// It governs the background (rolling/scheduled) checks, which are kept
+	// deliberately gentle so they never run as a burst against metered proxies.
+	HealthConcurrency int `json:"health_concurrency"`
+	// SweepConcurrency is the concurrency used by an operator-triggered full
+	// sweep ("scan now" / 立即扫描). Probing a 5000-entry pool at
+	// HealthConcurrency takes the better part of an hour and looks like nothing
+	// is happening; an explicit run is allowed to be much faster. 0 falls back to
+	// HealthConcurrency.
+	SweepConcurrency int `json:"sweep_concurrency"`
+	// HealthTimeoutSeconds bounds a single proxy probe.
+	HealthTimeoutSeconds int `json:"health_timeout_seconds"`
+	// FastLatencyMs / MidLatencyMs define the latency bands. A probe at or below
+	// FastLatencyMs is tier fast, at or below MidLatencyMs is tier mid, anything
+	// slower is tier slow. Selection prefers lower tiers.
+	FastLatencyMs int `json:"fast_latency_ms"`
+	MidLatencyMs  int `json:"mid_latency_ms"`
+	// DisableAfterFailures marks a proxy unhealthy after this many consecutive
+	// failed probes (or real-request transport failures). 0 disables the count.
+	DisableAfterFailures int `json:"disable_after_failures"`
+	// RetireAfterFailures permanently retires a proxy after this many
+	// consecutive failed probes, removing it from selection and further sweeps.
+	// 0 disables retirement.
+	RetireAfterFailures int `json:"retire_after_failures"`
+	// RejectAfterFailures retires a proxy after this many *consecutive* real
+	// requests the upstream refused for it (a bare 400/403 while the proxy itself
+	// is reachable). The health probe only measures reachability, so a pool whose
+	// exits are mostly refused upstream would otherwise never converge onto the
+	// ones that work. Any real 2xx resets the streak. Absent/0 uses the default;
+	// set it negative to switch this signal off.
+	RejectAfterFailures int `json:"reject_after_failures"`
+	// AnonymousMaxAttempts caps how many proxies a single anonymous request
+	// tries before giving up and falling back to the key tiers. Without a cap a
+	// mostly-dead pool makes every request walk the whole pool and hang. 0
+	// keeps the legacy behavior (try every proxy).
+	AnonymousMaxAttempts int `json:"anonymous_max_attempts"`
+	// AnonymousGateCooldownSeconds parks an egress for this long after the free
+	// tier refuses it with a 403 gate response ("free tier can only be used from
+	// within OpenCode"). Such refusals are per exit IP and persist, so a short
+	// cooldown lets a mostly-flagged pool saturate its cooldowns and fail every
+	// request. 0 uses the plain failure cooldown.
+	AnonymousGateCooldownSeconds int `json:"anonymous_gate_cooldown_seconds"`
+	// KeyProxyMode controls whether authenticated (Zen/Go) key traffic egresses
+	// directly or through the proxy pool:
+	//   "direct" (default) — keys connect directly, keeping a stable exit IP so
+	//      the account is not flagged for IP hopping; only the anonymous free
+	//      lane uses the pool.
+	//   "pool" — keys are distributed across the pool like the anonymous lane.
+	KeyProxyMode string `json:"key_proxy_mode"`
+	// Tiered enables latency-tiered selection: healthy proxies in a faster band
+	// are preferred, slower bands are only used when no faster proxy is usable.
+	Tiered bool `json:"tiered"`
+	// FallbackProxyFile optionally lists a second, lower-priority proxy set
+	// (e.g. a local bridge exposing paid nodes as http://127.0.0.1:port). Its
+	// entries join the pool marked as fallback, and the anonymous lane walks the
+	// entire primary tier before touching them — so cheap/scraped proxies are
+	// preferred and the fallback is only reached when the primary is out.
+	// Empty disables the fallback tier.
+	FallbackProxyFile string `json:"fallback_proxyfile"`
+	// FallbackMaxAttempts caps how many fallback proxies a single anonymous
+	// request tries once the primary tier produced no 2xx. <=0 uses the default
+	// when FallbackProxyFile is set, and means "no fallback tier" otherwise.
+	FallbackMaxAttempts int `json:"fallback_max_attempts"`
+}
+
+func defaultProxyPool() ProxyPoolConfig {
+	return ProxyPoolConfig{
+		HealthMode:                   "rolling",
+		HealthTickSeconds:            30,
+		HealthBatchSize:              40,
+		HealthIntervalSeconds:        1800,
+		HealthConcurrency:            5,
+		SweepConcurrency:             24,
+		HealthTimeoutSeconds:         6,
+		FastLatencyMs:                800,
+		MidLatencyMs:                 2500,
+		DisableAfterFailures:         1,
+		RetireAfterFailures:          8,
+		RejectAfterFailures:          4,
+		AnonymousMaxAttempts:         10,
+		AnonymousGateCooldownSeconds: 900,
+		KeyProxyMode:                 "direct",
+		Tiered:                       true,
+		FallbackMaxAttempts:          6,
+	}
+}
+
+// Defaults fills unset fields so a partial (or absent) proxy_pool section is
+// usable. Negative values are clamped to 0 (disabled) rather than defaulted.
+func (c *ProxyPoolConfig) Defaults() {
+	d := defaultProxyPool()
+	if c.HealthIntervalSeconds == 0 && c.HealthConcurrency == 0 && c.HealthTimeoutSeconds == 0 &&
+		c.FastLatencyMs == 0 && c.MidLatencyMs == 0 && c.DisableAfterFailures == 0 && c.RetireAfterFailures == 0 && !c.Tiered {
+		// Entire section absent: adopt the defaults wholesale.
+		*c = d
+		return
+	}
+	if c.HealthIntervalSeconds < 0 {
+		c.HealthIntervalSeconds = 0
+	}
+	if c.HealthConcurrency < 1 {
+		c.HealthConcurrency = d.HealthConcurrency
+	}
+	if c.SweepConcurrency < 0 {
+		c.SweepConcurrency = 0
+	}
+	if c.HealthTimeoutSeconds < 1 {
+		c.HealthTimeoutSeconds = d.HealthTimeoutSeconds
+	}
+	if c.MidLatencyMs < 1 {
+		c.MidLatencyMs = d.MidLatencyMs
+	}
+	if c.FastLatencyMs < 1 || c.FastLatencyMs > c.MidLatencyMs {
+		c.FastLatencyMs = d.FastLatencyMs
+	}
+	if c.DisableAfterFailures < 0 {
+		c.DisableAfterFailures = 0
+	}
+	if c.RetireAfterFailures < 0 {
+		c.RetireAfterFailures = 0
+	}
+	// RejectAfterFailures treats 0 as "unset" rather than "off": a config written
+	// before this option existed must not silently opt out of the convergence it
+	// exists to provide. A negative value switches it off explicitly.
+	if c.RejectAfterFailures == 0 {
+		c.RejectAfterFailures = d.RejectAfterFailures
+	}
+	if c.RejectAfterFailures < 0 {
+		c.RejectAfterFailures = 0
+	}
+	if c.RetireAfterFailures > 0 && c.DisableAfterFailures > 0 && c.RetireAfterFailures < c.DisableAfterFailures {
+		c.RetireAfterFailures = c.DisableAfterFailures
+	}
+	if c.KeyProxyMode != "pool" {
+		c.KeyProxyMode = "direct"
+	}
+	if c.HealthMode != "sweep" {
+		c.HealthMode = "rolling"
+	}
+	if c.HealthTickSeconds < 1 {
+		c.HealthTickSeconds = d.HealthTickSeconds
+	}
+	if c.HealthBatchSize < 1 {
+		c.HealthBatchSize = d.HealthBatchSize
+	}
+	if c.AnonymousMaxAttempts < 0 {
+		c.AnonymousMaxAttempts = 0
+	}
+	if c.AnonymousMaxAttempts == 0 && c.HealthIntervalSeconds == 0 && c.HealthConcurrency == 0 && !c.Tiered {
+		// A zeroed section (e.g. from an older config) adopts the default.
+		c.AnonymousMaxAttempts = d.AnonymousMaxAttempts
+	}
+	if c.AnonymousGateCooldownSeconds < 0 {
+		c.AnonymousGateCooldownSeconds = 0
+	}
+	c.FallbackProxyFile = strings.TrimSpace(c.FallbackProxyFile)
+	if c.FallbackProxyFile == "" {
+		// No fallback source configured: the tier is off regardless of the cap.
+		c.FallbackMaxAttempts = 0
+	} else if c.FallbackMaxAttempts <= 0 {
+		c.FallbackMaxAttempts = d.FallbackMaxAttempts
+	}
+}
+
+// HealthInterval returns the full-sweep period, or 0 when the periodic sweep is
+// disabled.
+func (c ProxyPoolConfig) HealthInterval() time.Duration {
+	return time.Duration(c.HealthIntervalSeconds) * time.Second
+}
+
+// HealthTimeout returns the per-probe timeout.
+func (c ProxyPoolConfig) HealthTimeout() time.Duration {
+	return time.Duration(c.HealthTimeoutSeconds) * time.Second
+}
+
+// HealthTick returns the rolling batch cadence.
+func (c ProxyPoolConfig) HealthTick() time.Duration {
+	return time.Duration(c.HealthTickSeconds) * time.Second
+}
+
+// AttemptTimeout bounds how long a single upstream attempt may wait for
+// response headers before it is abandoned and the next node is tried. Values
+// <= 0 keep the historical behavior of using the request-level retry timeout,
+// so existing configs are unaffected. The result never exceeds requestTimeout.
+// It bounds the whole attempt up to the response being released (dial, request
+// write, headers and, when enabled, the first SSE event); an established
+// stream keeps flowing under the request-level timeout.
 // AttemptTimeout returns the bound for a single upstream attempt. When
 // attempt_timeout_seconds is positive the result is that setting, capped at
 // requestTimeout only when requestTimeout is positive. Otherwise the result is
@@ -244,6 +454,7 @@ func Load(path string) (Config, error) {
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
+		ProxyPool:   defaultProxyPool(),
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -264,6 +475,7 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if err := cfg.Rotation.Validate(nil); err != nil {
 		return Config{}, err
 	}
+	cfg.ProxyPool.Defaults()
 	trimList(&cfg.ServerKeys)
 	remapServerKeyMetadata(&cfg)
 
@@ -470,6 +682,15 @@ func (cfg Config) RuntimeProxies() []string {
 	return []string{"direct"}
 }
 
+// RuntimeFallbackProxies returns the resolved fallback-tier proxy list (from
+// ProxyPool.FallbackProxyFile), or nil when no fallback tier is configured.
+// Like RuntimeProxies it is resolved-only and never persisted back to config.
+func (cfg Config) RuntimeFallbackProxies() []string {
+	return cfg.fallbackProxies
+}
+
+// PasswordForSave ensures resolved-only data is excluded. The method is kept
+// separate to make accidental persistence of effective proxy values obvious.
 // PasswordForSave clears the resolved proxy list (the proxies plus proxyfile
 // entries that RuntimeProxies returns), leaving only Config.Proxies; despite
 // its name it does not touch the WebUI password. SaveAtomic calls it on its

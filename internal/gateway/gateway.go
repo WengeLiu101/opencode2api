@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode2api/internal/config"
@@ -87,6 +88,16 @@ type Gateway struct {
 	// freeTierBlock is how long an exit the free tier flagged stays out of the
 	// anonymous cursor. Zero uses freeTierBlockTTL.
 	freeTierBlock time.Duration
+	// regionLocked records models that returned a region error on the anonymous
+	// lane, so later requests steer them to non-restricted exit regions. Lazily
+	// initialised to avoid touching the constructor.
+	regionMu     sync.Mutex
+	regionLocked map[string]struct{}
+	// sweep holds the operator-triggered full sweep's progress so the management
+	// UI can follow it, and sweepCancel stops a run in flight.
+	sweepMu     sync.Mutex
+	sweepState  SweepProgress
+	sweepCancel context.CancelFunc
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -100,16 +111,34 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics) (*G
 	if err != nil {
 		return nil, err
 	}
-	transports, err := transportPool(cfg.RuntimeProxies(), cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
+	keysDirect := cfg.ProxyPool.KeyProxyMode != "pool"
+	proxies := cfg.RuntimeProxies()
+	if keysDirect {
+		// Make sure a local egress exists for the keyed lanes to pin to. A config
+		// whose proxies all come from proxyfile has no direct entry, and without
+		// this key_proxy_mode="direct" would silently degrade to spreading every
+		// key across the pool — the exact opposite of what it asks for.
+		proxies = config.EnsureDirect(proxies)
+	}
+	transports, err := transportPool(proxies, cfg.RuntimeFallbackProxies(), cfg.Performance, cfg.ProxyPool, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
 	if err != nil {
 		return nil, err
 	}
+	if keysDirect {
+		if transports.directIndex >= 0 {
+			logger.Info("keyed lanes pinned to the direct egress",
+				"component", "gateway", "event", "keys_direct", "direct_index", transports.directIndex, "transports", len(transports.items))
+		} else {
+			logger.Warn("key_proxy_mode=direct but no direct egress is available; keyed lanes keep sharing the pool",
+				"component", "gateway", "event", "keys_direct_unavailable")
+		}
+	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	zenNodes, err := nodePool(cfg.ZenKeys, transports, cooldown)
+	zenNodes, err := nodePool(cfg.ZenKeys, transports, cooldown, keysDirect)
 	if err != nil {
 		return nil, fmt.Errorf("zen node pool: %w", err)
 	}
-	goNodes, err := nodePool(cfg.GoKeys, transports, cooldown)
+	goNodes, err := nodePool(cfg.GoKeys, transports, cooldown, keysDirect)
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}

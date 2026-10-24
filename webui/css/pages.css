@@ -377,3 +377,224 @@
     grid-column: 1 / -1;
   }
 }
+
+/* ---------- 代理池（本地功能） ---------- */
+.pool-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(252px, 1fr));
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+}
+.pool-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border-1);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+.pool-group.active {
+  border-color: var(--border-2);
+  box-shadow: inset 0 0 0 1px var(--border-2);
+}
+.pool-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+.pool-group-name {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-1);
+}
+.pool-group-count {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+}
+.pool-group-meta {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+.pool-group-ops {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: var(--sp-2);
+}
+.pool-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+.pool-filter.hidden {
+  display: none;
+}
+.pool-sweep-bar {
+  margin: var(--sp-3) 0 var(--sp-1);
+}
+.pool-sweep-state {
+  margin-bottom: 5px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+
+/* ===== system_monitor design system alignment =====
+   参照 system_monitor/UI_DESIGN_GUIDE.md：
+   三级字号 15-16 / 13-14 / 11-12；同行控件统一 30px；蓝色强调色；
+   复选框/单选框保持原生尺寸（该规范里明确的高度规则例外）。
+   ------------------------------------------------------------------ */
+
+/* 1) 强调色：蓝色。上游把强调色都走在 --inverse-* 通道上，
+      所以重映射这三个变量就能把按钮/进度条/选中态一起换成蓝色。
+      浅色下填充按钮用更深的蓝，保证白字对比度 ≥4.5:1。 */
+:root {
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-weak: #eef3ff;
+  --inverse-bg: #1d4ed8;
+  --inverse-hover: #1e40af;
+  --inverse-text: #ffffff;
+  --focus-ring: rgba(37, 99, 235, 0.22);
+  --ctrl-h: 30px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --primary: #60a5fa;
+    --primary-hover: #3b82f6;
+    --primary-weak: #16233b;
+    --inverse-bg: #3b82f6;
+    --inverse-hover: #60a5fa;
+    --inverse-text: #ffffff;
+    --focus-ring: rgba(59, 130, 246, 0.35);
+  }
+}
+
+/* 2) 三级字号：页标题 20px，区块标题 16px（--fs-lg），正文 13px，辅助 11-12px */
+.page-title { font-size: var(--fs-2xl); line-height: 1.25; }
+.page-sub,
+.section-caption { font-size: var(--fs-sm); }
+.section-title { font-size: var(--fs-lg); line-height: 1.3; }
+
+/* 3) 同一行控件等高 30px（与 .btn-sm 对齐）；整行不允许参差不齐 */
+.btn-sm {
+  height: var(--ctrl-h);
+  min-width: 68px;
+  padding: 0 10px;
+  font-size: var(--fs-sm);
+}
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+select {
+  height: var(--ctrl-h);
+  padding: 0 10px;
+}
+textarea { padding: 8px 10px; min-height: 72px; }
+
+/* 复选框 / 单选框：保持原生约 14px，且必须显式压掉通用 input 的尺寸规则，
+   否则 min-width 会把它们撑开（规范「踩坑记录 1」）。 */
+input[type="checkbox"],
+input[type="radio"] {
+  width: 14px;
+  height: 14px;
+  min-width: 0;
+  padding: 0;
+  accent-color: var(--inverse-bg);
+}
+
+/* 4) 卡片与表格密度：8px 圆角、16px 内边距；表格行更紧凑 */
+.section {
+  padding: var(--sp-4);
+  border-radius: 8px;
+}
+.table th,
+.table td { padding: 6px 10px; }
+.table th { font-size: var(--fs-xs); }
+
+/* 5) 导航选中态：主色弱底 + 主色文字（优于纯灰底，层级更清楚） */
+.nav-item.active {
+  background: var(--primary-weak);
+  color: var(--primary);
+  font-weight: 600;
+}
+.nav-item:hover { background: var(--bg-subtle); }
+
+/* 6) 指标卡：标签 12px、数值 30px，内边距略收紧 */
+.metric { padding: var(--sp-3) var(--sp-4); }
+.metric-label { font-size: var(--fs-sm); }
+
+/* ===== responsive: resolution / zoom adaptation =====
+   规范要求三级字号（15-16 / 13-14 / 11-12）。这里用 clamp 让它们在**区间内**
+   随视口平滑变化：小视口（高 DPI 缩放后只剩 ~1024 CSS px）取下限，常规 1280-1440
+   取中值，超宽屏取上限。所有同行控件仍共用同一个 --ctrl-h，红线②的“等高”不受影响。
+   ------------------------------------------------------------------ */
+:root {
+  --fs-xs: clamp(10.5px, 0.112vw + 9.36px, 11.5px);
+  --fs-sm: clamp(11.5px, 0.112vw + 10.36px, 12.5px);
+  --fs-base: clamp(12.5px, 0.112vw + 11.36px, 13.5px);
+  --fs-lg: clamp(15.0px, 0.167vw + 13.29px, 16.5px);
+  --fs-2xl: clamp(18.0px, 0.223vw + 15.71px, 20.0px);
+  /* 控件高度固定 30px：红线②要求同一行等高，不随视口浮动 */
+  --ctrl-h: 30px;}
+
+/* 中等宽度：侧栏固定占 232px，内容开始吃紧 → 指标改两列、内边距收一档 */
+@media (max-width: 1180px) {
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .topbar {
+    padding: var(--sp-5) var(--sp-5) var(--sp-3);
+  }
+
+  main {
+    padding: var(--sp-5) var(--sp-5) var(--sp-10);
+  }
+
+  .section {
+    padding: var(--sp-3) var(--sp-4);
+  }
+
+  /* 代理池表：窄屏先砍掉「分级」「上次探测」这类次要列，
+     留下代理/档位/地区/延迟/健康/失败/操作 7 列，避免横向滚动。 */
+  #page-pool .table th:nth-child(5),
+  #page-pool .table td:nth-child(5),
+  #page-pool .table th:nth-child(8),
+  #page-pool .table td:nth-child(8) {
+    display: none;
+  }
+}
+
+/* 窄屏（980 断点上游已把侧栏变成顶部横排），此处只再收紧区块内边距 */
+@media (max-width: 980px) {
+  .section {
+    padding: var(--sp-3);
+  }
+
+  .table th,
+  .table td {
+    padding: 5px 8px;
+  }
+}
+
+/* 超宽屏：把内容最大宽度放宽，别把界面挤成中间一条 */
+@media (min-width: 1600px) {
+  :root {
+    --content-max: 1440px;
+  }
+}
+
+/* 高 DPI 屏：1px 边框在 2x 下会显得过粗，略提亮以保持同样的视觉重量 */
+@media (min-resolution: 1.5dppx) {
+  .section,
+  .metrics,
+  .table th,
+  .table td {
+    border-color: color-mix(in srgb, var(--border-1) 82%, var(--surface));
+  }
+}

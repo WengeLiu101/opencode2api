@@ -207,7 +207,23 @@ textarea {
   text-align: left;
   vertical-align: baseline;
   border-bottom: 1px solid var(--border-1);
+  /* Proxy URLs and model ids are single tokens; breaking them mid-string reads
+     as garbage. Keep cells on one line and let .table-wrap scroll instead. */
+  white-space: nowrap;
+}
+
+/* A cell that genuinely holds prose opts back in. */
+.table td.wrap {
+  white-space: normal;
   overflow-wrap: anywhere;
+}
+
+/* The proxy column truncates rather than widening the table forever; the full
+   value stays available via the cell's title attribute. */
+.table td.truncate {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .table th {

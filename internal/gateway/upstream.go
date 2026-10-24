@@ -345,17 +345,15 @@ func (g *Gateway) maxAnonymousExits() int {
 	return defaultMaxAnonymousExits
 }
 
-// doAnonymousUpstream walks the session's anonymous proxy cursor. Each static
-// proxy is tried at most once, up to performance.max_anonymous_exits proxies;
-// rotating #pool proxies may be drawn again until Retry.MaxAttempts proxies
-// were used. For each proxy it tries the upstreams in anonymousUpstreams
-// order: the configured v2 /inference upstream (Upstream.Anonymous) before the
-// v1 lane (models.V1Base). Any failure, including an HTTP error response,
-// advances to the next upstream or proxy; a proxy-route failure, or a proxy
-// marked unhealthy, skips that proxy's remaining upstreams. Only a successful
-// response ends the anonymous phase; exhausting the proxy cursor returns
-// control to the preferred authenticated tiers. It returns the last response
-// (body still open), else the last error, plus the number of attempts made.
+// doAnonymousUpstream walks the anonymous lane: the primary proxies first,
+// then the fallback tier (paid bridge) when the primary produced no 2xx. Every
+// exit is tried at most once per tier, up to that tier's attempt budget;
+// rotating #pool entries may be drawn again until retry.max_attempts proxies
+// were used. For each exit it tries the upstreams in anonymousUpstreams order.
+// A lane-level circuit breaker holds the whole phase shut after repeated
+// failures, and an exit the free tier flagged is cooled instead of retried.
+// It returns the last response (body still open), else the last error, plus the
+// number of attempts made.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	// The breaker holds the lane shut for an hour-scale window after repeated
 	// failures: poking a flagged upstream again would only extend the block.
@@ -363,33 +361,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		return nil, errAnonymousLanePaused, 0
 	}
 	defer g.anonymous.ReleaseProbe()
-	var lastResponse *http.Response
-	var lastErr error
-	// blocked records that some exit is under the free tier's IP block. The
-	// result then reports errFreeTierIPBlocked even when no exit was left to
-	// try, so the caller can report the block instead of a generic failure.
-	blocked := false
-	// halted records that the upstream rejected the request itself. The result
-	// then reports errDeterministicClientRejection so the caller keeps this
-	// 4xx instead of replacing it with a later tier's answer.
-	halted := false
-	cursor := g.anonymous.CursorFor(ids.Session)
-	limit := min(g.anonymous.Len(), g.maxAnonymousExits())
-	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
-		limit = g.cfg.Retry.MaxAttempts
-	}
-	proxies := 0
-	attempts := 0
+
 	rawBody := bodies[config.TierZen]
 	if len(rawBody) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
 	}
-	// The anonymous free tier only serves agent-shaped streaming requests
-	// carrying the required tool definitions (anything else is rejected with 403
-	// FreeTierError). Normalize the wire body per upstream gate (v1 /zen vs v2
-	// /inference); the gateway collapses the stream back when the downstream
-	// client asked for a plain JSON reply. Key tiers shape their own bodies
-	// (see shapeKeyBody).
 	protocol := route.ProtocolFor(config.TierZen)
 	upstreams := g.anonymousUpstreams()
 	preparedBodies := make([][]byte, len(upstreams))
@@ -397,6 +373,118 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	for i, baseURL := range upstreams {
 		preparedBodies[i], toolAliases[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL))
 	}
+	block := g.regionBlockFor(route.ID)
+
+	var lastResponse *http.Response
+	var lastErr error
+	total := 0
+	blocked := false
+	halted := false
+
+	// Primary tier first; the fallback tier (paid bridge) is only touched when
+	// the primary produced no 2xx, so cheap exits are preferred and metered
+	// quota is reserved for when the primary is out.
+	type tierScan struct {
+		fallback bool
+		max      int
+	}
+	tiers := []tierScan{{false, g.cfg.ProxyPool.AnonymousMaxAttempts}}
+	if g.cfg.ProxyPool.FallbackMaxAttempts > 0 {
+		tiers = append(tiers, tierScan{true, g.cfg.ProxyPool.FallbackMaxAttempts})
+	}
+	for _, tier := range tiers {
+		if tier.fallback && (ctx.Err() != nil || g.anonymous.LenTier(true) == 0) {
+			continue
+		}
+		resp, err, n, scanHalted, scanBlocked, ok := g.anonymousScanTier(ctx, route, ids,
+			upstreams, preparedBodies, toolAliases, block, tier.fallback, tier.max, attemptOffset, total)
+		total += n
+		if resp != nil {
+			if lastResponse != nil {
+				httpx.DrainAndClose(lastResponse.Body)
+			}
+			lastResponse = resp
+		}
+		if err != nil {
+			lastErr = err
+		}
+		blocked = blocked || scanBlocked
+		if ok {
+			return resp, nil, total
+		}
+		if scanHalted {
+			halted = true
+			break
+		}
+		if g.anonymous.Open() {
+			break
+		}
+	}
+
+	// Every configured exit is under the same IP block: another request cannot
+	// reach a working exit, so pause the lane instead of repeating the 403 walk
+	// until the exit cool-downs expire.
+	if blocked && g.anonymous.blockedExits(time.Now()) {
+		if pause, tripped := g.anonymous.ForceOpen(); tripped {
+			g.logger.Warn("anonymous lane circuit breaker opened", "component", "upstream", "event", "anonymous_breaker_open", "reason", "all_exits_blocked", "request_id", ids.Request, "paused_for", pause.String())
+		}
+	}
+	if lastResponse != nil {
+		// The caller keeps and forwards this response; a block or a
+		// deterministic rejection only changes the error so the keyed tiers
+		// are skipped. A request-level rejection wins over a block seen on an
+		// earlier exit: it is the error the client can act on, and forwarding
+		// the block instead would hide the real cause.
+		if halted {
+			return lastResponse, errDeterministicClientRejection, total
+		}
+		if blocked {
+			return lastResponse, errFreeTierIPBlocked, total
+		}
+		return lastResponse, nil, total
+	}
+	if blocked {
+		return nil, errFreeTierIPBlocked, total
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no healthy anonymous proxies available")
+		if !g.transports.hasHealthy() {
+			lastErr = fmt.Errorf("no healthy anonymous proxies available: %w", errProxyUnavailable)
+		}
+	}
+	return nil, lastErr, total
+}
+
+// anonymousScanTier walks one tier of the anonymous lane: the primary proxies
+// (wantFallback false) or the fallback proxies. Every exit is tried at most
+// once, up to the tier's attempt budget; rotating #pool entries may be drawn
+// again until retry.max_attempts proxies were used. For each exit it tries the
+// upstreams in order and skips the exit's remaining upstreams after a proxy
+// transport failure. It returns ok=true only for a 2xx that ends the phase.
+//
+// attemptBase is the number of attempts already spent by earlier tiers, so the
+// caller's retry budget and telemetry stay coherent across tiers.
+func (g *Gateway) anonymousScanTier(ctx context.Context, route models.Route, ids identity.RequestIDs,
+	upstreams []string, preparedBodies [][]byte, toolAliases []string, block map[string]bool,
+	wantFallback bool, maxAttempts, attemptOffset, attemptBase int) (*http.Response, error, int, bool, bool, bool) {
+
+	limit := g.anonymous.LenTier(wantFallback)
+	if limit == 0 {
+		return nil, nil, 0, false, false, false
+	}
+	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
+		limit = g.cfg.Retry.MaxAttempts
+	}
+	if maxAttempts > 0 && maxAttempts < limit {
+		limit = maxAttempts
+	}
+	cursor := g.anonymous.CursorForRegionTier(ids.Session, block, wantFallback)
+	proxies := 0
+	attempts := 0
+	var lastResponse *http.Response
+	var lastErr error
+	blocked := false
+	halted := false
 	for proxies < limit {
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead
@@ -429,16 +517,16 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			setRequestShape(ctx, false, toolAliases[index])
 			attempts++
 			if meta := telemetry.MetaFromContext(ctx); meta != nil {
-				meta.Attempts = attemptOffset + attempts
+				meta.Attempts = attemptOffset + attemptBase + attempts
 				meta.Tier = string(config.TierZen)
 			}
 			if lastResponse != nil {
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, preparedBodies[index], ids, anonymousZenKey)
+			req, err := upstreamRequest(ctx, baseURL, route.ProtocolFor(config.TierZen), preparedBodies[index], ids, anonymousZenKey)
 			if err != nil {
-				return nil, err, attempts
+				return nil, err, attempts, halted, blocked, false
 			}
 			if node.proxy.pool {
 				req.Close = true
@@ -458,16 +546,16 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			}
 			nodeResp, nodeErr = resp, err
-			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
+			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attemptBase+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 			if err == nil && resp.StatusCode/100 == 2 {
 				g.observeAnonymousResult(ctx, node, resp, nil)
-				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
-				return resp, nil, attempts
+				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attemptBase+attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				return resp, nil, attempts, false, false, true
 			}
 			lastResponse = resp
 			lastErr = asProxyUnavailable(node.proxy, err)
 			if err != nil {
-				g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+				g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attemptBase+attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
 				if isProxyFailure(err) {
 					break
 				}
@@ -480,17 +568,17 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				node.proxy.markBlocked(time.Now().Add(g.freeTierBlockTTL()))
 				lastErr = errFreeTierIPBlocked
 				blocked = true
-				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())
+				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attemptBase+attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())
 				break
 			} else if isDeterministicClientResponse(resp.StatusCode, peekResponseBody(resp)) {
 				// The request is too long, malformed, or otherwise invalid on
 				// every lane. Stop here and hand this 4xx to the client.
 				lastErr = errDeterministicClientRejection
 				halted = true
-				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attemptBase+attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 				break
 			} else {
-				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attemptBase+attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			}
 			if index+1 < len(upstreams) && !node.proxy.healthy.Load() {
 				break
@@ -515,38 +603,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			break
 		}
 	}
-	// Every configured exit is under the same IP block: another request
-	// cannot reach a working exit, so pause the lane instead of repeating the
-	// 403 walk until the exit cool-downs expire.
-	if blocked && g.anonymous.blockedExits(time.Now()) {
-		if pause, tripped := g.anonymous.ForceOpen(); tripped {
-			g.logger.Warn("anonymous lane circuit breaker opened", "component", "upstream", "event", "anonymous_breaker_open", "reason", "all_exits_blocked", "request_id", ids.Request, "paused_for", pause.String())
-		}
-	}
-	if lastResponse != nil {
-		// The caller keeps and forwards this response; a block or a
-		// deterministic rejection only changes the error so the keyed tiers
-		// are skipped. A request-level rejection wins over a block seen on an
-		// earlier exit: it is the error the client can act on, and forwarding
-		// the block instead would hide the real cause.
-		if halted {
-			return lastResponse, errDeterministicClientRejection, attempts
-		}
-		if blocked {
-			return lastResponse, errFreeTierIPBlocked, attempts
-		}
-		return lastResponse, nil, attempts
-	}
-	if blocked {
-		return nil, errFreeTierIPBlocked, attempts
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no healthy anonymous proxies available")
-		if !g.transports.hasHealthy() {
-			lastErr = fmt.Errorf("no healthy anonymous proxies available: %w", errProxyUnavailable)
-		}
-	}
-	return nil, lastErr, attempts
+	return lastResponse, lastErr, attempts, halted, blocked, false
 }
 
 // anonymousUpstreams returns the ordered base URLs for the keyless free tier:
@@ -1264,19 +1321,29 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 	g.syncProxyResult(ctx, node.proxy, status, err)
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
+		g.transports.acceptExit(node.proxy)
 		g.anonymous.NoteSuccess()
-	} else {
-		g.anonymous.MarkFailure(node, resp, err)
-		if resp != nil && peekNetworkAbuseBlock(resp) {
-			// An IP block is scoped to this exit; doAnonymousUpstream marks it
-			// blocked and opens the lane breaker only when no exit is left.
-			// Counting it here as well would stop the other exits early.
-			return
-		}
-		if pause, tripped := g.anonymous.NoteFailure(); tripped {
-			g.logger.Warn("anonymous lane circuit breaker opened",
-				"component", "upstream", "event", "anonymous_breaker_open", "status", status, "paused_for", pause.String())
-		}
+		return
+	}
+	g.anonymous.MarkFailure(node, resp, err)
+	if resp != nil && peekNetworkAbuseBlock(resp) {
+		// An IP block is scoped to this exit; doAnonymousUpstream marks it
+		// blocked and opens the lane breaker only when no exit is left.
+		// Counting it here as well would stop the other exits early.
+		return
+	}
+	if pause, tripped := g.anonymous.NoteFailure(); tripped {
+		g.logger.Warn("anonymous lane circuit breaker opened",
+			"component", "upstream", "event", "anonymous_breaker_open", "status", status, "paused_for", pause.String())
+	}
+	// A bare 400/403 on this lane means the free tier refused the exit IP, not
+	// that the request was malformed (the body is normalised for this lane before
+	// it is sent). The reachability probe cannot see the difference, so count the
+	// refusal here and let the pool retire exits upstream will not serve.
+	if err == nil && isExitRefusal(status) && g.transports.rejectExit(node.proxy, g.cfg.ProxyPool.RejectAfterFailures) {
+		g.logger.Info("proxy retired: upstream repeatedly refused this exit",
+			"component", "proxy", "event", "proxy_retired_rejected",
+			"proxy", config.RedactURL(node.proxy.name), "status", status)
 	}
 }
 

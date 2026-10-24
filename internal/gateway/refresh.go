@@ -12,7 +12,14 @@ import (
 )
 
 const (
-	proxyHealthCheckURL      = "https://cloudflare.com/cdn-cgi/trace"
+	// The probe target is the OpenCode origin itself, not a generic
+	// reachability site: providers routinely block cloudflare.com on their
+	// egress while still serving opencode fine, so a cloudflare probe
+	// falsely retired exits that real traffic could use (measured 2026-10-22:
+	// 1400 exits retired by the probe, 8/8 real requests 200 through them).
+	// checkClaimedProxy counts any HTTP response as success, so a 404 from
+	// the origin still proves the tunnel reaches it.
+	proxyHealthCheckURL      = "https://opencode.ai/"
 	proxyHealthCheckInterval = 15 * time.Minute
 	proxyHealthCheckTimeout  = 10 * time.Second
 )
@@ -38,6 +45,11 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 		return false
 	}
 	if isProxyFailure(err) {
+		// Take the proxy out of selection immediately. The verification probe
+		// below confirms the verdict asynchronously, but waiting for it means the
+		// next requests keep spending a full timeout on a node we already know is
+		// unreachable. A successful probe restores it (applyProxyHealthResult).
+		proxy.healthy.Store(false)
 		g.rebindFailedProxy(proxy)
 		g.verifyProxyAfterError(ctx, proxy, "proxy transport error", status)
 		return true
@@ -107,34 +119,250 @@ func (g *Gateway) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
 	return zenMoved, goMoved
 }
 
-// StartProxyHealthChecks rechecks unhealthy proxies every
-// proxyHealthCheckInterval until ctx is canceled. There is no check at
-// startup, since every proxy starts healthy.
-func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
-	check := func() {
-		results := g.transports.CheckHealth(ctx, proxyHealthCheckURL, proxyHealthCheckTimeout)
+// SweepProgress is a snapshot of a running (or last finished) full sweep. The
+// management UI polls it to show a progress bar and, once done, what the run
+// actually changed.
+type SweepProgress struct {
+	Running    bool   `json:"running"`
+	Source     string `json:"source"`
+	StartedAt  string `json:"started_at,omitempty"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	Total      int    `json:"total"`
+	Done       int    `json:"done"`
+	Passed     int    `json:"passed"`
+	Failed     int    `json:"failed"`
+	Retired    int    `json:"retired"`
+	Restored   int    `json:"restored"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+// SweepProgress returns the current or last finished sweep's progress.
+func (g *Gateway) SweepProgress() SweepProgress {
+	if g == nil {
+		return SweepProgress{}
+	}
+	g.sweepMu.Lock()
+	defer g.sweepMu.Unlock()
+	return g.sweepState
+}
+
+func (g *Gateway) updateSweepState(mutate func(*SweepProgress)) {
+	g.sweepMu.Lock()
+	mutate(&g.sweepState)
+	g.sweepMu.Unlock()
+}
+
+// CancelProxySweep stops a full sweep in flight. Reports whether one was running.
+func (g *Gateway) CancelProxySweep() bool {
+	if g == nil {
+		return false
+	}
+	g.sweepMu.Lock()
+	cancel := g.sweepCancel
+	g.sweepMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+// sweepChunkSize bounds how many probes are dispatched before progress is
+// published, so the UI advances smoothly without a lock per probe.
+const sweepChunkSize = 64
+
+// proxySweepOnce probes every candidate once, applies the results, publishes
+// progress and persists the pool state. includeRetired is set for explicit
+// operator-triggered runs: a retired proxy is otherwise never probed again, so
+// it could never come back on its own.
+func (g *Gateway) proxySweepOnce(ctx context.Context, source string, includeRetired bool) {
+	if g == nil || g.transports == nil {
+		return
+	}
+	timeout := g.cfg.ProxyPool.HealthTimeout()
+	if timeout <= 0 {
+		timeout = proxyHealthCheckTimeout
+	}
+	candidates := g.transports.sweepCandidates(includeRetired)
+	started := time.Now()
+	g.updateSweepState(func(s *SweepProgress) {
+		*s = SweepProgress{
+			Running: true, Source: source, StartedAt: started.Format(time.RFC3339), Total: len(candidates),
+		}
+	})
+
+	passed, failed, retired, restored := 0, 0, 0, 0
+	for i := 0; i < len(candidates); i += sweepChunkSize {
+		if ctx.Err() != nil {
+			break
+		}
+		end := min(i+sweepChunkSize, len(candidates))
+		results := g.transports.runProbes(ctx, candidates[i:end], proxyHealthCheckURL, timeout, g.cfg.ProxyPool.SweepConcurrency)
 		for _, result := range results {
-			g.applyProxyHealthResult(result, "scheduled health check", 0)
+			wasRetired := result.proxy.retired.Load()
+			g.applyProxyHealthResult(result, source, 0)
+			if result.err == nil {
+				passed++
+				if wasRetired && g.transports.reviveRetired(result.proxy) {
+					restored++
+					g.logger.Info("retired proxy is reachable again",
+						"component", "proxy", "event", "proxy_retired_revived", "proxy", config.RedactURL(result.proxy.name))
+				}
+			} else {
+				failed++
+			}
+			if result.retired {
+				retired++
+			}
+		}
+		done := end
+		g.updateSweepState(func(s *SweepProgress) {
+			s.Done, s.Passed, s.Failed, s.Retired, s.Restored = done, passed, failed, retired, restored
+			s.DurationMs = time.Since(started).Milliseconds()
+		})
+	}
+
+	total, healthy := g.transports.healthCounts()
+	if err := g.transports.SaveState(); err != nil {
+		g.logger.Warn("proxy state save failed", "component", "proxy", "event", "proxy_state_save_failed", "error", err)
+	}
+	g.updateSweepState(func(s *SweepProgress) {
+		s.Running = false
+		s.FinishedAt = time.Now().Format(time.RFC3339)
+		s.DurationMs = time.Since(started).Milliseconds()
+	})
+	g.logger.Info("proxy sweep complete", "component", "proxy", "event", "proxy_sweep",
+		"source", source, "probed", len(candidates), "passed", passed, "failed", failed,
+		"retired", retired, "restored", restored, "cancelled", ctx.Err() != nil,
+		"duration_ms", time.Since(started).Milliseconds(), "pool_total", total, "pool_healthy", healthy)
+	if total > 0 && healthy*5 < total {
+		g.logger.Warn("proxy pool is mostly unavailable; free models will fall back or fail",
+			"component", "proxy", "event", "proxy_pool_degraded", "pool_total", total, "pool_healthy", healthy)
+	}
+}
+
+// TriggerProxySweep starts a full sweep in the background (manual action).
+// Reports false when one is already running, so the caller can tell the
+// operator instead of silently queueing a second pass over the whole pool.
+func (g *Gateway) TriggerProxySweep() bool {
+	if g == nil {
+		return false
+	}
+	g.sweepMu.Lock()
+	if g.sweepState.Running {
+		g.sweepMu.Unlock()
+		return false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	g.sweepCancel = cancel
+	g.sweepMu.Unlock()
+	go func() {
+		defer func() {
+			g.sweepMu.Lock()
+			g.sweepCancel = nil
+			g.sweepMu.Unlock()
+			cancel()
+		}()
+		g.proxySweepOnce(ctx, "manual sweep", true)
+	}()
+	return true
+}
+
+// proxySweepBatchOnce probes one rolling batch and persists state only when
+// something changed, so a metered proxy plan is not charged for idle writes.
+func (g *Gateway) proxySweepBatchOnce(ctx context.Context, batch int) {
+	timeout := g.cfg.ProxyPool.HealthTimeout()
+	if timeout <= 0 {
+		timeout = proxyHealthCheckTimeout
+	}
+	results := g.transports.SweepBatch(ctx, proxyHealthCheckURL, timeout, batch)
+	changed := false
+	for _, result := range results {
+		g.applyProxyHealthResult(result, "rolling check", 0)
+		if result.failed || result.retired {
+			changed = true
 		}
 	}
+	if changed {
+		if err := g.transports.SaveState(); err != nil {
+			g.logger.Warn("proxy state save failed", "component", "proxy", "event", "proxy_state_save_failed", "error", err)
+		}
+	}
+}
+
+// StartProxyHealthChecks starts the periodic proxy health checks.
+func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
+	if g.cfg.ProxyPool.HealthMode == "rolling" {
+		tick := g.cfg.ProxyPool.HealthTick()
+		batch := g.cfg.ProxyPool.HealthBatchSize
+		go func() {
+			// One batch soon after startup so latency begins populating, then a
+			// small batch every tick — never a burst.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Second):
+				g.proxySweepBatchOnce(ctx, batch)
+			}
+			ticker := time.NewTicker(tick)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					g.proxySweepBatchOnce(ctx, batch)
+				}
+			}
+		}()
+		return
+	}
+	timeout := g.cfg.ProxyPool.HealthTimeout()
+	if timeout <= 0 {
+		timeout = proxyHealthCheckTimeout
+	}
+	interval := g.cfg.ProxyPool.HealthInterval()
+	if interval <= 0 {
+		// Periodic full sweep disabled: keep the legacy behavior of only
+		// re-checking proxies already marked unhealthy.
+		go func() {
+			ticker := time.NewTicker(proxyHealthCheckInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					for _, result := range g.transports.CheckHealth(ctx, proxyHealthCheckURL, timeout) {
+						g.applyProxyHealthResult(result, "scheduled health check", 0)
+					}
+				}
+			}
+		}()
+		return
+	}
 	go func() {
-		ticker := time.NewTicker(proxyHealthCheckInterval)
+		// Populate latency and health soon after startup, then sweep on the
+		// configured interval.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Second):
+			g.proxySweepOnce(ctx, "startup sweep", false)
+		}
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				check()
+				g.proxySweepOnce(ctx, "scheduled sweep", false)
 			}
 		}
 	}()
 }
 
-// applyProxyHealthResult acts on one health check: a pass restores a proxy
-// that was unhealthy, a proxy-route failure rebinds its keys only while some
-// proxy is still healthy, and an inconclusive error changes nothing. source
-// and upstreamStatus only label the log.
 func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string, upstreamStatus int) {
 	if result.err == nil {
 		if !result.wasHealthy {

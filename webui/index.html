@@ -60,6 +60,7 @@
           <div class="nav-group">
             <div class="nav-group-title" data-i18n="nav.group.system">系统</div>
             <button class="nav-item" data-page="config" data-i18n="nav.config">配置中心</button>
+            <button class="nav-item" data-page="pool" data-i18n="nav.pool">代理池</button>
             <button class="nav-item" data-page="account" data-i18n="nav.account">账号安全</button>
           </div>
         </nav>
@@ -746,6 +747,79 @@
             </section>
           </section>
 
+          <section id="page-pool" class="page hidden">
+            <div class="metrics">
+              <div class="metric">
+                <div class="metric-label">池内代理</div>
+                <div id="pool-total" class="metric-value">—</div>
+                <div class="metric-note">不含已剔除</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">健康</div>
+                <div id="pool-healthy" class="metric-value">—</div>
+                <div class="metric-note">当前可用</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">快档</div>
+                <div id="pool-fast" class="metric-value">—</div>
+                <div class="metric-note">延迟 ≤ 快档阈值</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">已剔除</div>
+                <div id="pool-retired" class="metric-value">—</div>
+                <div class="metric-note">长期不通</div>
+              </div>
+            </div>
+            <section class="section">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title">分组管理</h2>
+                  <p class="section-caption">按维度归组，可整组筛选 / 定点扫描 / 批量剔除·恢复。</p>
+                </div>
+                <div class="actions" id="pool-group-dims"></div>
+              </div>
+              <div id="pool-groups" class="pool-groups"></div>
+              <div id="pool-filter-chip" class="pool-filter hidden"></div>
+            </section>
+            <section class="section">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title">代理池</h2>
+                  <p class="section-caption" id="pool-summary-note">按延迟分级与地区归类。</p>
+                </div>
+                <div class="actions">
+                  <input id="pool-search" placeholder="筛选 代理 / 地区" />
+                  <button id="pool-refresh" type="button" class="btn btn-sm btn-ghost">刷新</button>
+                  <button id="pool-sweep" type="button" class="btn btn-sm btn-primary">立即扫描</button>
+                  <button id="pool-sweep-stop" type="button" class="btn btn-sm btn-danger hidden">停止扫描</button>
+                  <button id="pool-reset" type="button" class="btn btn-sm btn-ghost">解除全部剔除</button>
+                </div>
+              </div>
+              <div class="pool-sweep-bar">
+                <div id="pool-sweep-state" class="pool-sweep-state">尚未扫描</div>
+                <div class="tier-track"><div id="pool-sweep-fill" class="tier-fill"></div></div>
+              </div>
+              <div class="table-wrap">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>代理</th>
+                      <th>档位</th>
+                      <th>地区</th>
+                      <th>延迟</th>
+                      <th>分级</th>
+                      <th>健康</th>
+                      <th>失败 / 被拒</th>
+                      <th>上次探测</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pool-rows"></tbody>
+                </table>
+              </div>
+              <p class="section-caption">最多展示 400 条。地区由内嵌 GeoIP 本地解析；分级依据最近一次探测延迟。</p>
+            </section>
+          </section>
           <section id="page-config" class="page hidden">
             <form id="config-form" class="stack">
               <div class="tabs" role="tablist" aria-label="配置分区">

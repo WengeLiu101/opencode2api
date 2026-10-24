@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +64,12 @@ func (a *Server) Handler() http.Handler {
 	mux.Handle("POST /api/config/reveal", a.authenticate(a.csrf(http.HandlerFunc(a.handleReveal))))
 	mux.Handle("PUT /api/account", a.authenticate(a.csrf(http.HandlerFunc(a.handleAccount))))
 	mux.Handle("GET /api/monitor", a.authenticate(http.HandlerFunc(a.handleMonitor)))
+	mux.Handle("GET /api/pool", a.authenticate(http.HandlerFunc(a.handlePool)))
+	mux.Handle("POST /api/pool/sweep", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolSweep))))
+	mux.Handle("POST /api/pool/sweep/cancel", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolSweepCancel))))
+	mux.Handle("POST /api/pool/retire", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolRetire))))
+	mux.Handle("POST /api/pool/check", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolCheck))))
+	mux.Handle("POST /api/pool/reset", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolReset))))
 	mux.Handle("GET /api/debug/models", a.authenticate(http.HandlerFunc(a.handleDebugModels)))
 	mux.Handle("GET /api/models/availability", a.authenticate(http.HandlerFunc(a.handleAvailability)))
 	mux.Handle("POST /api/models/restore", a.authenticate(a.csrf(http.HandlerFunc(a.handleRestoreModel))))
@@ -94,9 +101,20 @@ func (a *Server) staticHandler() http.Handler {
 		}
 		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 			if _, err := fs.Stat(assets, strings.TrimPrefix(r.URL.Path, "/")); err != nil {
+				// Only route-like (extension-less) paths fall back to the shell.
+				// Answering a missing .css/.js with index.html makes the browser
+				// parse HTML as CSS/JS, so a stale cached page after an upgrade
+				// shows up as a silently unstyled UI instead of a 404.
+				if path.Ext(r.URL.Path) != "" {
+					writeAdminError(w, http.StatusNotFound, "not_found", "asset not found")
+					return
+				}
 				r.URL.Path = "/"
 			}
 		}
+		// The UI is embedded in the binary and changes only on rebuild; force
+		// revalidation so a rebuilt binary's assets are never served stale.
+		w.Header().Set("Cache-Control", "no-cache")
 		files.ServeHTTP(w, r)
 	})
 }
@@ -142,6 +160,7 @@ type ConfigView struct {
 	Logging     config.LoggingConfig     `json:"logging"`
 	Prefer      config.Tier              `json:"prefer"`
 	Reasoning   config.ReasoningConfig   `json:"reasoning"`
+	ProxyPool   config.ProxyPoolConfig   `json:"proxy_pool"`
 	WebUI       WebUIView                `json:"webui"`
 	Effective   EffectiveView            `json:"effective"`
 	Restart     []string                 `json:"restart_required_fields,omitempty"`
@@ -191,6 +210,7 @@ type ConfigUpdate struct {
 	// A pointer distinguishes an omitted field (legacy clients should keep the
 	// current reasoning configuration) from an explicit empty object (clear it).
 	Reasoning *config.ReasoningConfig `json:"reasoning,omitempty"`
+	ProxyPool *config.ProxyPoolConfig `json:"proxy_pool,omitempty"`
 	WebUI     WebUIView               `json:"webui"`
 }
 
@@ -235,12 +255,17 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if update.Reasoning != nil {
 		reasoning = *update.Reasoning
 	}
+	proxyPool := current.ProxyPool
+	if update.ProxyPool != nil {
+		proxyPool = *update.ProxyPool
+	}
 	candidate := config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
 		Rotation:          current.Rotation,
 		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
 		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
+		ProxyPool: proxyPool,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
 	result, err := a.manager.Apply(candidate, true)
@@ -281,6 +306,61 @@ func (a *Server) handleReveal(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("sensitive configuration revealed", "component", "auth", "event", "secrets_revealed", "client_ip", clientIP(r))
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "proxies": cfg.Proxies})
+}
+
+func (a *Server) handlePool(w http.ResponseWriter, _ *http.Request) {
+	proxies, summary := a.manager.ProxyStats()
+	// The sweep snapshot rides along with the pool view so the UI can follow a
+	// run in progress (and show what the last one changed) with one poll.
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"proxies": proxies, "summary": summary, "sweep": a.manager.SweepProgress(),
+	})
+}
+
+func (a *Server) handlePoolSweep(w http.ResponseWriter, _ *http.Request) {
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"started": a.manager.TriggerProxySweep()})
+}
+
+func (a *Server) handlePoolSweepCancel(w http.ResponseWriter, _ *http.Request) {
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"stopping": a.manager.CancelProxySweep()})
+}
+
+func (a *Server) handlePoolRetire(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID      string   `json:"id"`
+		IDs     []string `json:"ids"`
+		Retired bool     `json:"retired"`
+	}
+	if err := decodeAdminJSON(w, r, &body); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	// Bulk form: ids retires/restores a whole group in one call (the single-id
+	// form keeps working for the per-row button).
+	if len(body.IDs) > 0 {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"changed": a.manager.RetireProxies(body.IDs, body.Retired)})
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"changed": a.manager.RetireProxy(body.ID, body.Retired)})
+}
+
+func (a *Server) handlePoolCheck(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs []string `json:"ids"`
+	}
+	if err := decodeAdminJSON(w, r, &body); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if len(body.IDs) == 0 {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", "ids must not be empty")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"checked": a.manager.CheckProxiesNow(body.IDs)})
+}
+
+func (a *Server) handlePoolReset(w http.ResponseWriter, _ *http.Request) {
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"restored": a.manager.ClearRetiredProxies()})
 }
 
 // handleMonitor answers with the build version, the metrics snapshot and the
@@ -382,7 +462,7 @@ func (a *Server) configView() ConfigView {
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
 		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
-		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning,
+		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning, ProxyPool: cfg.ProxyPool,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},
 		Restart:   restart,

@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/andybalholm/brotli v1.1.1
 	github.com/klauspost/compress v1.18.0
+	github.com/phuslu/iploc v1.0.20261015
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/crypto v0.41.0
 )

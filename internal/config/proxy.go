@@ -59,6 +59,38 @@ func resolveProxyFiles(configPath string, cfg *Config) error {
 		effective = []string{"direct"}
 	}
 	cfg.effectiveProxies = effective
+
+	// The fallback tier is a separate, lower-priority list (e.g. a local bridge
+	// exposing paid nodes). It is resolved the same way and de-duplicated
+	// against the primary set, so a proxy appearing in both stays primary.
+	cfg.fallbackProxies = nil
+	if file := strings.TrimSpace(cfg.ProxyPool.FallbackProxyFile); file != "" {
+		resolvedFallback := file
+		if !filepath.IsAbs(resolvedFallback) {
+			resolvedFallback = filepath.Join(filepath.Dir(configPath), resolvedFallback)
+		}
+		fallback, err := readProxyFile(resolvedFallback)
+		if err != nil {
+			return fmt.Errorf("load fallback proxy file %s: %w", resolvedFallback, err)
+		}
+		primary := make(map[string]struct{}, len(effective))
+		for _, item := range effective {
+			primary[item] = struct{}{}
+		}
+		out := fallback[:0]
+		seen := make(map[string]struct{}, len(fallback))
+		for _, item := range fallback {
+			if _, dup := primary[item]; dup {
+				continue
+			}
+			if _, dup := seen[item]; dup {
+				continue
+			}
+			seen[item] = struct{}{}
+			out = append(out, item)
+		}
+		cfg.fallbackProxies = out
+	}
 	return nil
 }
 
@@ -134,6 +166,28 @@ func uniqueProxyEntries(items []string) []string {
 		out = append(out, item)
 	}
 	return out
+}
+
+// IsDirect reports whether a proxy entry is the local-egress marker.
+func IsDirect(raw string) bool {
+	return strings.EqualFold(strings.TrimSpace(raw), "direct")
+}
+
+// EnsureDirect returns proxies with a "direct" entry appended when it has none.
+// Callers that need a guaranteed local egress (key_proxy_mode = "direct" pins the
+// keyed lanes to it) must use this instead of assuming the configured list has
+// one: a config whose proxies all come from proxyfile has no direct transport,
+// and without this the setting would silently degrade to "spread every key
+// across the pool" — a no-op that looks like it worked.
+func EnsureDirect(proxies []string) []string {
+	for _, item := range proxies {
+		if IsDirect(item) {
+			return proxies
+		}
+	}
+	out := make([]string, 0, len(proxies)+1)
+	out = append(out, proxies...)
+	return append(out, "direct")
 }
 
 // trimList trims every item in place and drops the empty ones.

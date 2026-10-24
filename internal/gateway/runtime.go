@@ -184,6 +184,25 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 	gateway.catalog.SetAvailabilityStore(availability)
 	gateway.availability = availability
 	gateway.catalog.SetCachePath(modelcatalog.CatalogCachePath(m.configPath))
+	// Startup tier census: makes "did the fallback tier actually load?" an
+	// observable fact instead of an inference.
+	primaryCount, fallbackCount := 0, 0
+	for _, proxy := range gateway.transports.items {
+		if proxy.fallback {
+			fallbackCount++
+		} else {
+			primaryCount++
+		}
+	}
+	m.logger.Info("proxy pool loaded",
+		"component", "proxy", "event", "proxy_pool_loaded",
+		"primary", primaryCount, "fallback", fallbackCount)
+	if m.configPath != "" {
+		gateway.transports.SetStatePath(m.configPath + ".proxy-pool.json")
+		if err := gateway.transports.LoadState(); err != nil {
+			m.logger.Warn("proxy pool state ignored", "component", "proxy", "event", "proxy_state_load_failed", "error", err)
+		}
+	}
 	return &gatewayRuntime{config: cfg, gateway: gateway, availability: availability, handler: gateway.Handler(), cancel: func() {}}, nil
 }
 
@@ -428,6 +447,90 @@ func (m *RuntimeController) Resources() ResourceSnapshot {
 		result.Proxies = append(result.Proxies, status)
 	}
 	return result
+}
+
+// ProxyStats forwards the current gateway's proxy-pool snapshot + summary.
+func (m *RuntimeController) ProxyStats() ([]ProxyStat, ProxyPoolSummary) {
+	runtime := m.current.Load()
+	if runtime == nil {
+		return nil, ProxyPoolSummary{}
+	}
+	return runtime.gateway.ProxyStats()
+}
+
+// TriggerProxySweep asks the current gateway to re-probe every proxy. Reports
+// false when a sweep is already running, so the caller can say so instead of
+// queueing a second pass over the whole pool.
+func (m *RuntimeController) TriggerProxySweep() bool {
+	if runtime := m.current.Load(); runtime != nil {
+		return runtime.gateway.TriggerProxySweep()
+	}
+	return false
+}
+
+// CancelProxySweep stops a full sweep in flight.
+func (m *RuntimeController) CancelProxySweep() bool {
+	if runtime := m.current.Load(); runtime != nil {
+		return runtime.gateway.CancelProxySweep()
+	}
+	return false
+}
+
+// SweepProgress returns the running or last finished sweep's progress.
+func (m *RuntimeController) SweepProgress() SweepProgress {
+	if runtime := m.current.Load(); runtime != nil {
+		return runtime.gateway.SweepProgress()
+	}
+	return SweepProgress{}
+}
+
+// RetireProxy retires or restores one proxy by id on the current gateway.
+func (m *RuntimeController) RetireProxy(id string, retired bool) int {
+	if runtime := m.current.Load(); runtime != nil {
+		return runtime.gateway.RetireProxy(id, retired)
+	}
+	return 0
+}
+
+// RetireProxies retires or restores a set of proxies by id on the current
+// gateway (bulk form of RetireProxy).
+func (m *RuntimeController) RetireProxies(ids []string, retired bool) int {
+	runtime := m.current.Load()
+	if runtime == nil {
+		return 0
+	}
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	return runtime.gateway.RetireProxies(set, retired)
+}
+
+// CheckProxiesNow probes the given proxies immediately on the current gateway.
+func (m *RuntimeController) CheckProxiesNow(ids []string) int {
+	runtime := m.current.Load()
+	if runtime == nil {
+		return 0
+	}
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return runtime.gateway.CheckProxiesNow(ctx, set)
+}
+
+// ClearRetiredProxies restores all retired proxies on the current gateway.
+func (m *RuntimeController) ClearRetiredProxies() int {
+	if runtime := m.current.Load(); runtime != nil {
+		return runtime.gateway.ClearRetiredProxies()
+	}
+	return 0
 }
 
 // DebugModels returns a routing diagnostic for every catalog model, with no
