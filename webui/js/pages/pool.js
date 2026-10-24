@@ -30,7 +30,7 @@ function groupKey(p, dim) {
 
 function groupLabel(key, dim) {
   if (dim === "source") return key === "fallback" ? "备用档 · 付费桥接" : "主档 · 免费池";
-  if (dim === "status") return { healthy: "健康", unhealthy: "不通", retired: "已剔除" }[key] || key;
+  if (dim === "status") return { healthy: "健康", unhealthy: "不通", retired: "短期排除" }[key] || key;
   if (dim === "tier") return `分级 · ${TIER_NAMES[Number(key)] ?? key}`;
   if (key === "??") return "地区 · 未知";
   if (key === "LOCAL") return "地区 · 本地桥接";
@@ -117,7 +117,7 @@ function renderGroups() {
       ]),
       el("div", {
         class: "pool-group-meta",
-        text: `健康 ${g.healthy}/${live}（${rate}%）· 平均 ${avg}` + (g.retired ? ` · 已剔除 ${g.retired}` : ""),
+        text: `健康 ${g.healthy}/${live}（${rate}%）· 平均 ${avg}` + (g.retired ? ` · 短期排除 ${g.retired}` : ""),
       }),
       el("div", { class: "pool-group-ops" }, [
         el("button", {
@@ -130,7 +130,7 @@ function renderGroups() {
         }),
         el("button", {
           type: "button", class: "btn btn-sm btn-ghost", text: "扫描本组",
-          title: `定点探测本组最多 ${GROUP_CHECK_CAP} 个（含已剔除，通了的会自动恢复）`,
+          title: `定点探测本组最多 ${GROUP_CHECK_CAP} 个（含短期排除项，通了的会自动恢复）`,
           onclick: () => checkGroup(g),
         }),
         el("button", {
@@ -186,7 +186,7 @@ function renderRows() {
       el("td", { text: p.fallback ? "本地桥接" : p.region || "—" }),
       el("td", { text: p.latency_ms >= 0 ? `${p.latency_ms} ms` : "—" }),
       el("td", { text: TIER_NAMES[p.tier] ?? "—" }),
-      el("td", { text: p.retired ? "已剔除" : p.healthy ? "健康" : "不通" }),
+      el("td", { text: p.retired ? "短期排除" : p.healthy ? "健康" : "不通" }),
       el("td", {
         text: String(p.failures ?? 0) + (p.rejections ? ` / 拒${p.rejections}` : ""),
       }),
@@ -225,7 +225,7 @@ async function checkGroup(g) {
 async function retire(ids, retired) {
   try {
     const result = await api("/api/pool/retire", { method: "POST", body: JSON.stringify({ ids, retired }) });
-    toast(`${retired ? "已剔除" : "已恢复"} ${result.changed} 个`);
+    toast(`${retired ? "已短期排除" : "已恢复"} ${result.changed} 个`);
     load();
   } catch (error) {
     toast(error.message, true);
@@ -244,6 +244,12 @@ async function load() {
     $("#pool-healthy").textContent = formatNumber(s.healthy ?? 0);
     $("#pool-fast").textContent = formatNumber(s.fast ?? 0);
     $("#pool-retired").textContent = formatNumber(s.retired ?? 0);
+    const retiredNote = $("#pool-retired-note");
+    if (retiredNote) {
+      retiredNote.textContent = (s.purged ?? 0) > 0
+        ? `待复活 · 已永久删除 ${formatNumber(s.purged)}`
+        : "待复活，超期永久删除";
+    }
     const regions = Object.entries(s.regions || {})
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
@@ -267,12 +273,38 @@ export default {
   init() {
     $("#pool-sweep-fill").style.width = "0";
     $("#pool-refresh").addEventListener("click", load);
+    $("#pool-import-btn").addEventListener("click", async () => {
+      const content = $("#pool-import-text").value.trim();
+      if (!content) return toast("请先粘贴代理列表", true);
+      const mode = $("#pool-import-mode").value;
+      if (mode === "replace" && !confirm("替换将重写整个主档代理文件（旧文件会自动备份为 .import.bak）。继续？")) return;
+      const button = $("#pool-import-btn");
+      button.disabled = true;
+      try {
+        const result = await api("/api/pool/import", {
+          method: "POST",
+          body: JSON.stringify({ content, mode }),
+        });
+        toast(
+          `导入 ${formatNumber(result.imported)} 条` +
+            (result.duplicates ? ` · 去重 ${result.duplicates}` : "") +
+            (result.invalid ? ` · 无效 ${result.invalid}` : "") +
+            (result.reloaded ? "，已热生效" : "")
+        );
+        $("#pool-import-text").value = "";
+        load();
+      } catch (error) {
+        toast(error.message || "导入失败", true);
+      } finally {
+        button.disabled = false;
+      }
+    });
     $("#pool-search").addEventListener("input", renderRows);
     $("#pool-sweep").addEventListener("click", async () => {
       try {
         const result = await api("/api/pool/sweep", { method: "POST", body: "{}" });
         if (result.started) {
-          toast("已开始全量扫描（含已剔除节点，可自动恢复）");
+          toast("已开始全量扫描（含短期排除节点，可自动恢复）");
           load();
         } else {
           toast("已有扫描在进行中", true);

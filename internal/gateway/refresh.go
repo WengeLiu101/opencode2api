@@ -552,3 +552,94 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *upstreamN
 	g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "upstream", config.RedactURL(base))
 	return nil
 }
+
+// StartProxyExpiryChecks runs the second stage of the retirement: excluded
+// (retired) primary entries are periodically probed for recovery, and entries
+// that stay excluded too long, or fail too many revival probes, are
+// permanently deleted from the proxy file. Fallback and direct entries are
+// never purged.
+func (g *Gateway) StartProxyExpiryChecks(ctx context.Context) {
+	interval := time.Duration(g.cfg.ProxyPool.ReviveIntervalSeconds) * time.Second
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		// Wait one interval before the first round so the rolling health
+		// checks populate the pool first.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				g.reviveExcluded(ctx)
+			}
+		}
+	}()
+}
+
+// reviveExcluded probes a bounded batch of excluded entries and either
+// restores the ones that recovered or moves them toward permanent deletion.
+func (g *Gateway) reviveExcluded(ctx context.Context) {
+	if g == nil || g.transports == nil {
+		return
+	}
+	excluded := g.transports.excludedEntries()
+	if len(excluded) == 0 {
+		return
+	}
+	const batch = 32
+	start := int(g.transports.reviveCursor.Add(1)-1) % len(excluded)
+	picks := make([]*proxyTransport, 0, batch)
+	for i := 0; i < batch && i < len(excluded); i++ {
+		picks = append(picks, excluded[(start+i)%len(excluded)])
+	}
+	timeout := g.cfg.ProxyPool.HealthTimeout()
+	if timeout <= 0 {
+		timeout = proxyHealthCheckTimeout
+	}
+	concurrency := min(8, len(picks))
+	for _, result := range g.transports.runProbes(ctx, picks, proxyHealthCheckURL, timeout, concurrency) {
+		proxy := result.proxy
+		if proxy == nil || proxy.purged.Load() {
+			continue
+		}
+		if result.err == nil {
+			// The probe reaches the origin where real traffic once failed:
+			// restore the entry and reset its exclusion clock.
+			if g.transports.reviveRetired(proxy) {
+				g.logger.Info("excluded proxy recovered; restored to selection",
+					"component", "proxy", "event", "proxy_restored",
+					"proxy", config.RedactURL(proxy.name), "latency_ms", proxy.latencyMs.Load())
+			}
+			continue
+		}
+		fails := proxy.reviveFails.Add(1)
+		var age time.Duration
+		if at := proxy.retiredAt.Load(); at > 0 {
+			age = time.Since(time.Unix(0, at))
+		}
+		poolCfg := g.cfg.ProxyPool
+		byProbes := poolCfg.ReviveProbes > 0 && int(fails) >= poolCfg.ReviveProbes
+		byAge := poolCfg.PurgeAfterMinutes > 0 && age >= time.Duration(poolCfg.PurgeAfterMinutes)*time.Minute
+		if !byProbes && !byAge {
+			continue
+		}
+		if g.transports.purgeProxy(proxy) {
+			reason := "revival_probes_exhausted"
+			if byAge {
+				reason = "exclusion_window_expired"
+			}
+			g.logger.Warn("excluded proxy purged from the pool file",
+				"component", "proxy", "event", "proxy_purged",
+				"proxy", config.RedactURL(proxy.name), "reason", reason,
+				"revive_fails", fails, "excluded_for", age.Round(time.Second).String())
+		}
+	}
+}

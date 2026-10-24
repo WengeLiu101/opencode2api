@@ -2,10 +2,14 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -199,6 +203,13 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 		"primary", primaryCount, "fallback", fallbackCount)
 	if m.configPath != "" {
 		gateway.transports.SetStatePath(m.configPath + ".proxy-pool.json")
+		if file := strings.TrimSpace(cfg.ProxyFile); file != "" {
+			resolved := file
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(m.configPath), resolved)
+			}
+			gateway.transports.SetPoolPath(resolved)
+		}
 		if err := gateway.transports.LoadState(); err != nil {
 			m.logger.Warn("proxy pool state ignored", "component", "proxy", "event", "proxy_state_load_failed", "error", err)
 		}
@@ -215,6 +226,7 @@ func (m *RuntimeController) start(runtime *gatewayRuntime) {
 	runtimeCtx, cancel := context.WithCancel(m.root)
 	runtime.cancel = cancel
 	runtime.gateway.StartProxyHealthChecks(runtimeCtx)
+	runtime.gateway.StartProxyExpiryChecks(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
 }
 
@@ -642,4 +654,120 @@ func keyStatuses(tier string, pool *upstreamNodes) []KeyStatus {
 		result = append(result, status)
 	}
 	return result
+}
+
+// PoolImportResult reports what a pool import changed.
+type PoolImportResult struct {
+	Imported   int  `json:"imported"`
+	Duplicates int  `json:"duplicates"`
+	Invalid    int  `json:"invalid"`
+	Total      int  `json:"total"`
+	Reloaded   bool `json:"reloaded"`
+}
+
+// ImportProxies rewrites (replace) or extends (append) the primary proxy file
+// with the pasted entries and hot-applies the result: the runtime is rebuilt
+// from the file, so the new pool takes effect without restarting the process.
+// The previous file contents are kept in <proxyfile>.import.bak.
+func (m *RuntimeController) ImportProxies(content string, replace bool) (PoolImportResult, error) {
+	result := PoolImportResult{}
+	current := m.current.Load()
+	if current == nil || current.gateway == nil || current.gateway.transports == nil {
+		return result, errors.New("gateway is not running")
+	}
+	transports := current.gateway.transports
+	seen := make(map[string]bool, 64)
+	lines := make([]string, 0, 64)
+	for _, line := range strings.Split(content, "\n") {
+		entry := strings.TrimSpace(line)
+		if entry == "" || strings.HasPrefix(entry, "#") {
+			continue
+		}
+		clean, _ := config.ParseProxyEntry(entry)
+		if !validProxyEntry(clean) {
+			result.Invalid++
+			continue
+		}
+		if seen[clean] {
+			result.Duplicates++
+			continue
+		}
+		seen[clean] = true
+		lines = append(lines, entry)
+	}
+	if !replace {
+		// Merge: keep the existing file entries the import does not mention.
+		existing, err := readPoolLines(transports)
+		if err != nil && !os.IsNotExist(err) {
+			return result, err
+		}
+		for _, entry := range existing {
+			clean, _ := config.ParseProxyEntry(entry)
+			if !seen[clean] {
+				seen[clean] = true
+				lines = append(lines, entry)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		return result, errors.New("no valid proxy entries to import")
+	}
+	if err := transports.SavePoolLines(lines); err != nil {
+		return result, err
+	}
+	result.Imported = len(lines)
+	result.Total = len(lines)
+	// Hot-apply: applying the current configuration rebuilds the runtime, and
+	// the rebuild re-reads the proxy file. The configuration itself is
+	// unchanged, so it is not re-saved.
+	if _, err := m.Apply(m.Config(), false); err != nil {
+		return result, fmt.Errorf("proxy file written, but the reload failed: %w", err)
+	}
+	result.Reloaded = true
+	return result, nil
+}
+
+// validProxyEntry reports whether a parsed entry is usable: "direct", or an
+// absolute URL with a host on a supported scheme.
+func validProxyEntry(clean string) bool {
+	if clean == "" {
+		return false
+	}
+	if clean == "direct" {
+		return true
+	}
+	u, err := url.Parse(clean)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	}
+	return false
+}
+
+// readPoolLines reads the primary proxy file's current lines.
+func readPoolLines(transports *proxyTransports) ([]string, error) {
+	if transports == nil {
+		return nil, errors.New("no proxy pool")
+	}
+	transports.fileMu.Lock()
+	path := transports.poolPath
+	transports.fileMu.Unlock()
+	if path == "" {
+		return nil, errors.New("no proxyfile is configured; add proxyfile to the config first")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		entry := strings.TrimSpace(line)
+		if entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out, nil
 }

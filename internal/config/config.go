@@ -282,6 +282,20 @@ type ProxyPoolConfig struct {
 	// request tries once the primary tier produced no 2xx. <=0 uses the default
 	// when FallbackProxyFile is set, and means "no fallback tier" otherwise.
 	FallbackMaxAttempts int `json:"fallback_max_attempts"`
+	// ReviveIntervalSeconds is how often excluded (retired) primary entries
+	// get a liveness probe while they are out of rotation. A probe that
+	// succeeds restores the entry; failures feed the purge decision below.
+	// 0 uses the default; negative disables revival probing.
+	ReviveIntervalSeconds int `json:"revive_interval_seconds,omitempty"`
+	// ReviveProbes is how many failed revival probes an excluded entry may
+	// accumulate before it is permanently deleted from the proxy file. 0 uses
+	// the default; negative disables purging by probe count.
+	ReviveProbes int `json:"revive_probes,omitempty"`
+	// PurgeAfterMinutes permanently deletes an excluded entry from the proxy
+	// file once it has been excluded this long, even if its revival probes
+	// have not all been spent. 0 uses the default; negative disables purging
+	// by age (exclusion then lasts until the operator acts).
+	PurgeAfterMinutes int `json:"purge_after_minutes,omitempty"`
 }
 
 func defaultProxyPool() ProxyPoolConfig {
@@ -303,6 +317,9 @@ func defaultProxyPool() ProxyPoolConfig {
 		KeyProxyMode:                 "direct",
 		Tiered:                       true,
 		FallbackMaxAttempts:          6,
+		ReviveIntervalSeconds:        900,
+		ReviveProbes:                 3,
+		PurgeAfterMinutes:            1440,
 	}
 }
 
@@ -348,6 +365,25 @@ func (c *ProxyPoolConfig) Defaults() {
 	}
 	if c.RejectAfterFailures < 0 {
 		c.RejectAfterFailures = 0
+	}
+	// Two-stage retirement: excluded entries are revival-probed every
+	// ReviveIntervalSeconds; ReviveProbes failed revivals, or PurgeAfterMinutes
+	// of exclusion, permanently deletes the entry from the proxy file. Zero
+	// adopts the default, a negative value switches that stage off.
+	if c.ReviveIntervalSeconds == 0 {
+		c.ReviveIntervalSeconds = d.ReviveIntervalSeconds
+	}
+	if c.ReviveIntervalSeconds < 0 {
+		c.ReviveIntervalSeconds = 0
+	}
+	if c.ReviveProbes == 0 {
+		c.ReviveProbes = d.ReviveProbes
+	}
+	if c.ReviveProbes < 0 {
+		c.ReviveProbes = 0
+	}
+	if c.PurgeAfterMinutes == 0 {
+		c.PurgeAfterMinutes = d.PurgeAfterMinutes
 	}
 	if c.RetireAfterFailures > 0 && c.DisableAfterFailures > 0 && c.RetireAfterFailures < c.DisableAfterFailures {
 		c.RetireAfterFailures = c.DisableAfterFailures

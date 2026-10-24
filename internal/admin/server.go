@@ -70,6 +70,7 @@ func (a *Server) Handler() http.Handler {
 	mux.Handle("POST /api/pool/retire", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolRetire))))
 	mux.Handle("POST /api/pool/check", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolCheck))))
 	mux.Handle("POST /api/pool/reset", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolReset))))
+	mux.Handle("POST /api/pool/import", a.authenticate(a.csrf(http.HandlerFunc(a.handlePoolImport))))
 	mux.Handle("GET /api/debug/models", a.authenticate(http.HandlerFunc(a.handleDebugModels)))
 	mux.Handle("GET /api/models/availability", a.authenticate(http.HandlerFunc(a.handleAvailability)))
 	mux.Handle("POST /api/models/restore", a.authenticate(a.csrf(http.HandlerFunc(a.handleRestoreModel))))
@@ -346,6 +347,24 @@ func (a *Server) handlePoolRetire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"changed": a.manager.RetireProxy(body.ID, body.Retired)})
+}
+
+// handlePoolImport rewrites or extends the primary proxy file from pasted
+// text and hot-applies the new pool.
+func (a *Server) handlePoolImport(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Content string `json:"content"`
+		Mode    string `json:"mode"`
+	}
+	if err := decodeAdminJSON(w, r, &input); err != nil {
+		return
+	}
+	result, err := a.manager.ImportProxies(input.Content, input.Mode != "append")
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, "import_failed", err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, result)
 }
 
 func (a *Server) handlePoolCheck(w http.ResponseWriter, r *http.Request) {

@@ -752,7 +752,7 @@
               <div class="metric">
                 <div class="metric-label">池内代理</div>
                 <div id="pool-total" class="metric-value">—</div>
-                <div class="metric-note">不含已剔除</div>
+                <div class="metric-note">不含短期排除项</div>
               </div>
               <div class="metric">
                 <div class="metric-label">健康</div>
@@ -765,9 +765,9 @@
                 <div class="metric-note">延迟 ≤ 快档阈值</div>
               </div>
               <div class="metric">
-                <div class="metric-label">已剔除</div>
+                <div class="metric-label">短期排除</div>
                 <div id="pool-retired" class="metric-value">—</div>
-                <div class="metric-note">长期不通</div>
+                <div class="metric-note" id="pool-retired-note">待复活，超期永久删除</div>
               </div>
             </div>
             <section class="section">
@@ -798,6 +798,17 @@
               <div class="pool-sweep-bar">
                 <div id="pool-sweep-state" class="pool-sweep-state">尚未扫描</div>
                 <div class="tier-track"><div id="pool-sweep-fill" class="tier-fill"></div></div>
+              </div>
+              <div class="pool-import">
+                <p class="section-caption">导入代理：一行一个（<code>direct</code> / <code>http://user:pass@host:port</code> / 末尾加 <code>#pool</code> 表示每次请求新建隧道）。<b>替换</b>＝重写主档（旧文件自动备份为 <code>.import.bak</code>）；<b>追加</b>＝与现有条目合并去重。导入后立即热生效，无需重启。</p>
+                <textarea id="pool-import-text" rows="4" spellcheck="false" placeholder="http://user:pass@host:port&#10;http://127.0.0.1:3129#pool"></textarea>
+                <div class="actions">
+                  <select id="pool-import-mode">
+                    <option value="replace">替换主档</option>
+                    <option value="append">追加合并</option>
+                  </select>
+                  <button id="pool-import-btn" type="button" class="btn btn-sm btn-primary">导入并生效</button>
+                </div>
               </div>
               <div class="table-wrap">
                 <table class="table">

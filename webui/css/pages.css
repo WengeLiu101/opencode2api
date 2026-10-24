@@ -598,3 +598,33 @@ input[type="radio"] {
     border-color: color-mix(in srgb, var(--border-1) 82%, var(--surface));
   }
 }
+
+/* ===== pool import card =====
+   导入区沿用页面既有的 30px 控件高度与 8px 圆角；textarea 允许纵向拉伸手动
+   核对长列表，等宽字体让 user:pass@host:port 对齐。 */
+.pool-import {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--border-1);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.pool-import textarea {
+  min-height: 84px;
+  max-height: 40vh;
+  resize: vertical;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.pool-import .actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.pool-import .actions select {
+  height: var(--ctrl-h);
+}

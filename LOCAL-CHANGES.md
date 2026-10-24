@@ -15,6 +15,26 @@
 
 ---
 
+## 〇ter、2026-10-24 对齐上游 main @ 57b906b + 代理池自维护 + 两级剔除
+
+**基线**：`jasonxu114514/opencode2api` **main @ `57b906b`**（含我们提交并被上游合并的 PR #111/#112，以及 OpenCode 2.1 客户端伪装 #141/#142/#143、显式关闭推理 #150、意大利语本地化）。版本标记 `v1.4.3-local.2`，升级前备份 `_backup_pre_import_20261024_123337/`。
+
+**合并方式（重要，以后照做）**：本地分支已重建在**真实上游历史**上（此前是从 tarball 快照建的合成历史，和上游不共享祖先，导致 `merge` 报 unrelated histories）。现在仓库结构是 `0bb23c7 → local features 提交 → merge upstream/main`，以后同步只需 `git fetch && git merge origin/main`，冲突面已缩到 2 处注释措辞。
+
+**新功能一：WebUI 代理池自维护（热生效，无需重启）**
+- `POST /api/pool/import`，body `{content, mode}`：`mode=replace` 重写主档、`append` 与现有文件合并去重；逐行校验（`direct` / `http(s)://` / `socks5://`），重复与无效分别计数。
+- 写入前把旧文件备份为 `<proxyfile>.import.bak`；随后调用 `RuntimeController.Apply(cfg, false)` **热重建网关**（`Reload → build → New → RuntimeProxies()` 会重读代理文件），新池立即生效、进程不重启。
+- 前端代理池页新增「导入代理」卡片：textarea + 模式下拉（控件高度同为 30px）+ 「导入并生效」；替换模式有二次确认。实测：替换导入 2 条有效 + 1 重复 + 1 无效 → `{imported:2, duplicates:1, invalid:1, reloaded:true}`，文件与内存池同步更新。
+
+**新功能二：两级剔除（短期排除 → 永久删除）**
+- **短期排除**：探测失败 / 真实请求被拒达阈值 → `retired`（沿用原机制），记录 `retired_at`。
+- **复活探测**：`revive_interval_seconds`（默认 900s）一轮，每轮最多 32 条，轮转覆盖；探测通 → 自动恢复（`proxy_restored`，重置排除时钟），失败 → 累计 `revive_fails`。
+- **永久删除**：`revive_fails ≥ revive_probes`（默认 3）**或** 排除时长 ≥ `purge_after_minutes`（默认 1440 = 24h）→ 从 `proxies_pool.txt` 物理删除、状态文件自动清理（`SaveState` 跳过已删除项），日志 `proxy_purged` 带 `reason`（`revival_probes_exhausted` / `exclusion_window_expired`）。`fallback`（付费桥接）与 `direct` **永不删除**。
+- 配置键：`proxy_pool.revive_interval_seconds` / `revive_probes` / `purge_after_minutes`；负值 = 关闭对应阶段。状态文件新增 `retired_at` / `revive_fails`（向后兼容旧文件）。
+- 实测四条分支全过：按次数删除（2 次测活失败）、按时间删除（60s 窗口到点）、恢复（Clash 出口复活，951ms）、健康条目不受影响。
+
+**修复**：`excludedEntries()` 按 `retired_at` 升序，保证先排除的先处理；`purgeProxy` 拒绝删除 fallback/direct。
+
 ## 〇bis、2026-10-22 升级到上游 main（v1.4.3 发布版 + 8 个未发版修复）
 
 **基线**：`jasonxu114514/opencode2api` **main @ `0bb23c7`**（含 `v1.4.3` tag 及其后 8 个提交）。
@@ -35,6 +55,13 @@
 **修掉一个潜伏 bug（本地 1.4.2 起就有）**
 - `anonymousCursor.Next()` 在**延迟分级开启**时扫完整个池只返回 **1 个节点**（offset 直接走到尾），等于「`anonymous_max_attempts=5` 实际只用 1 个出口」，而且**不报错**（铁律④的静默降级）。
 - 改为**一次性构建本请求的走访顺序 `plan`**（按 tier 排序，fast→slow），`Next()` 既兑现分级偏好、又能逐个返回；可用性在**取用时**重新判定（健康/退休/封禁/冷却/区域都会在请求进行中变化）。
+
+**2026-10-22 补记：探测修正与可用性诊断**
+- **探测目标改指 opencode**：`proxyHealthCheckURL` 由 `cloudflare.com/cdn-cgi/trace` 改为 `https://opencode.ai/`——探测要测的是「出口能否到达 opencode」，不是「能否到达 cloudflare」。`checkClaimedProxy` 只要拿到任何 HTTP 响应就算通（不看状态码），404 也证明隧道可达。
+- **探测改用 bun 客户端**：`checkClaimedProxy` 原先用 `proxy.client`（Go 原生 TLS），与真实免费流量（bun 伪装客户端）不同路。已改为优先 `proxy.bun`。
+- **本次 1400 条全灭的根因是套餐流量耗尽**（探测错误 1309 次 `Not Enough Bandwidth`），不是探测误杀——先前「探测口径误伤好代理」的猜测**不成立，已撤销**；但上面两条探测修正依然是正确的工程改进（以前测的是 cloudflare 可达性，以后测的才是 opencode 可达性）。
+- **公开代理路线已验证走不通（0/20 成功）**：2988 条公开 HTTP 代理 → TCP 可达 1137 → CONNECT 隧道可用 266 → 网关探测健康 60 → **真实请求全部 429**（opencode 免费层对这些被全世界共享白嫖的 IP 长期限流，隔 30 分钟复测依旧）。隧道本身是通的（能拿到 429 说明请求到达了 opencode），但免费层不放行。**结论：别再花时间找公开代理，免费层的瓶颈是「IP 没被限流」，不是代理数量。**
+- **探测脚本自身的教训**：第一版预筛脚本把 `asyncio.open_connection` 返回的元组当 writer 调 `.close()`，连接成功反而被 `except` 吞成失败 → 0% 存活。对照组（8.8.8.8:53 等已知通地址）当场暴露探针 bug。**批量探针先拿已知答案的样本自测**（铁律⑰）。
 
 **部署与验收**
 - 线上实例已切 `v1.4.3-local`：单进程、8790/8791 双监听、`proxy_pool_loaded primary=1401 fallback=67`。

@@ -71,6 +71,16 @@ type proxyTransport struct {
 	// leave the local egress behind (the free tier rate-limits and region-gates
 	// by exit IP), so trying direct there wastes an attempt per request.
 	direct bool
+	// retiredAt is when this entry entered the short-term exclusion (unix
+	// nanoseconds). Excluded entries are revival-probed; after reviveFails
+	// failed probes or purge_after_minutes of exclusion the entry is deleted
+	// from the proxy file for good.
+	retiredAt   atomic.Int64
+	reviveFails atomic.Uint32
+	// purged marks an entry permanently deleted from the pool file. It stays
+	// in memory (items is read concurrently by cursors) but is never selected
+	// and is hidden from the stats.
+	purged atomic.Bool
 }
 
 // blocked reports whether this exit is under the free tier's IP abuse block.
@@ -123,6 +133,13 @@ type proxyTransports struct {
 	// statePath, when set, persists per-proxy latency/failures/retired across
 	// restarts (keyed by proxy name).
 	statePath string
+	// poolPath, when set, is the primary proxy file this pool was loaded
+	// from: the import endpoint rewrites it and the purge stage removes
+	// permanently deleted entries from it. fileMu serializes its rewrites.
+	poolPath     string
+	fileMu       sync.Mutex
+	purgedCount  atomic.Int32
+	reviveCursor atomic.Uint64
 	// rollCursor advances the rolling health-check batch across the pool.
 	rollCursor atomic.Uint64
 }
@@ -530,7 +547,7 @@ func (p *proxyTransports) healthCounts() (total, healthy int) {
 		return 0, 0
 	}
 	for _, proxy := range p.items {
-		if proxy.retired.Load() {
+		if proxy.retired.Load() || proxy.purged.Load() {
 			continue
 		}
 		total++
@@ -566,6 +583,9 @@ func (p *proxyTransports) Stats() []ProxyStat {
 	}
 	out := make([]ProxyStat, 0, len(p.items))
 	for _, proxy := range p.items {
+		if proxy.purged.Load() {
+			continue
+		}
 		item := ProxyStat{
 			ID:         config.Fingerprint(proxy.name),
 			Name:       config.RedactURL(proxy.name),
@@ -739,11 +759,26 @@ func (p *proxyTransports) sweepCandidates(includeRetired bool) []*proxyTransport
 // the pool gave up on rejoins selection once it is reachable again. Retiring is
 // a heuristic, not a verdict — a node that was out of quota this month is fine
 // the next.
+// markRetired puts an entry into the short-term exclusion, recording when the
+// exclusion began so the second stage can purge it later.
+func (p *proxyTransports) markRetired(proxy *proxyTransport) {
+	if p == nil || proxy == nil {
+		return
+	}
+	if proxy.retired.CompareAndSwap(false, true) {
+		proxy.retiredAt.Store(time.Now().UnixNano())
+		proxy.reviveFails.Store(0)
+	}
+	proxy.healthy.Store(false)
+}
+
 func (p *proxyTransports) reviveRetired(proxy *proxyTransport) bool {
 	if p == nil || proxy == nil || !proxy.retired.Load() {
 		return false
 	}
 	proxy.retired.Store(false)
+	proxy.retiredAt.Store(0)
+	proxy.reviveFails.Store(0)
 	proxy.failures.Store(0)
 	proxy.rejections.Store(0)
 	proxy.healthy.Store(true)
@@ -771,8 +806,7 @@ func (p *proxyTransports) rejectExit(proxy *proxyTransport, threshold int) bool 
 	if proxy.retired.Load() || n < uint32(threshold) {
 		return false
 	}
-	proxy.retired.Store(true)
-	proxy.healthy.Store(false)
+	p.markRetired(proxy)
 	return true
 }
 
@@ -904,10 +938,8 @@ func (p *proxyTransports) checkClaimedProxy(ctx context.Context, proxy *proxyTra
 		// disabled below, so a genuinely dead node leaves selection until a probe
 		// succeeds again.
 		if p.retireAfter > 0 && !proxy.fallback && failures >= uint32(p.retireAfter) {
-			proxy.retired.Store(true)
+			p.markRetired(proxy)
 			result.retired = true
-			// A retired proxy is no longer a candidate for failover.
-			proxy.healthy.Store(false)
 		} else {
 			threshold := p.disableAfter
 			if threshold < 1 {
@@ -951,8 +983,7 @@ func (p *proxyTransports) SetRetired(id string, retired bool) int {
 			continue
 		}
 		if retired {
-			proxy.retired.Store(true)
-			proxy.healthy.Store(false)
+			p.markRetired(proxy)
 		} else {
 			proxy.retired.Store(false)
 			proxy.failures.Store(0)
@@ -975,8 +1006,7 @@ func (p *proxyTransports) SetRetiredMany(ids map[string]struct{}, retired bool) 
 			continue
 		}
 		if retired {
-			proxy.retired.Store(true)
-			proxy.healthy.Store(false)
+			p.markRetired(proxy)
 		} else {
 			proxy.retired.Store(false)
 			proxy.failures.Store(0)
@@ -1078,16 +1108,19 @@ func (g *Gateway) ClearRetiredProxies() int {
 
 // ProxyPoolSummary aggregates the pool for the management UI.
 type ProxyPoolSummary struct {
-	Total     int            `json:"total"`
-	Healthy   int            `json:"healthy"`
-	Unhealthy int            `json:"unhealthy"`
-	Retired   int            `json:"retired"`
-	Fast      int            `json:"fast"`
-	Mid       int            `json:"mid"`
-	Slow      int            `json:"slow"`
-	Unknown   int            `json:"unknown"`
-	Tiered    bool           `json:"tiered"`
-	Regions   map[string]int `json:"regions"`
+	Total     int `json:"total"`
+	Healthy   int `json:"healthy"`
+	Unhealthy int `json:"unhealthy"`
+	Retired   int `json:"retired"`
+	// Purged is how many entries this process permanently deleted from the
+	// pool file (the second stage of the two-stage retirement).
+	Purged  int            `json:"purged"`
+	Fast    int            `json:"fast"`
+	Mid     int            `json:"mid"`
+	Slow    int            `json:"slow"`
+	Unknown int            `json:"unknown"`
+	Tiered  bool           `json:"tiered"`
+	Regions map[string]int `json:"regions"`
 }
 
 // ProxyStats exposes the proxy-pool snapshot plus a summary for the UI.
@@ -1121,6 +1154,7 @@ func (g *Gateway) ProxyStats() ([]ProxyStat, ProxyPoolSummary) {
 			sum.Regions[s.Region]++
 		}
 	}
+	sum.Purged = int(g.transports.purgedCount.Load())
 	return stats, sum
 }
 
@@ -1133,7 +1167,11 @@ type proxyPersist struct {
 	// evidence that a large pool is converging onto its usable exits.
 	Rejections uint32 `json:"rejections,omitempty"`
 	Retired    bool   `json:"retired"`
-	LastProbe  int64  `json:"last_probe,omitempty"`
+	// RetiredAt / ReviveFails persist the two-stage retirement so a restart
+	// does not restart the exclusion clock or refund spent revival probes.
+	RetiredAt   int64  `json:"retired_at,omitempty"`
+	ReviveFails uint32 `json:"revive_fails,omitempty"`
+	LastProbe   int64  `json:"last_probe,omitempty"`
 }
 
 type poolStateFile struct {
@@ -1150,6 +1188,123 @@ func (p *proxyTransports) SetStatePath(path string) {
 // LoadState restores per-proxy latency, failures and retirement from disk.
 // Entries for proxies no longer in the pool are ignored; a missing file is not
 // an error. Delete the state file to un-retire every proxy.
+// SetPoolPath marks path as the primary proxy file this pool was loaded
+// from. Only then can the import endpoint rewrite it, and the purge stage
+// delete permanently excluded entries from it.
+func (p *proxyTransports) SetPoolPath(path string) {
+	if p == nil {
+		return
+	}
+	p.fileMu.Lock()
+	defer p.fileMu.Unlock()
+	p.poolPath = path
+}
+
+// SavePoolLines rewrites the primary proxy file with lines, keeping a
+// one-generation backup at poolPath + ".import.bak".
+func (p *proxyTransports) SavePoolLines(lines []string) error {
+	if p == nil {
+		return errors.New("no proxy pool")
+	}
+	p.fileMu.Lock()
+	defer p.fileMu.Unlock()
+	if p.poolPath == "" {
+		return errors.New("no proxyfile is configured; add proxyfile to the config first")
+	}
+	if data, err := os.ReadFile(p.poolPath); err == nil {
+		_ = os.WriteFile(p.poolPath+".import.bak", data, 0o600)
+	}
+	out := make([]byte, 0, 64*len(lines))
+	for _, line := range lines {
+		out = append(out, line...)
+		out = append(out, '\n')
+	}
+	tmp := p.poolPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p.poolPath)
+}
+
+// RemovePoolLines deletes the raw entries named in gone from the primary
+// proxy file and reports how many lines it removed. A missing file, or names
+// that are no longer present, are not an error.
+func (p *proxyTransports) RemovePoolLines(gone map[string]struct{}) int {
+	if p == nil || p.poolPath == "" || len(gone) == 0 {
+		return 0
+	}
+	p.fileMu.Lock()
+	defer p.fileMu.Unlock()
+	data, err := os.ReadFile(p.poolPath)
+	if err != nil {
+		return 0
+	}
+	var kept []string
+	removed := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := gone[trimmed]; ok {
+			removed++
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	if removed == 0 {
+		return 0
+	}
+	out := make([]byte, 0, 64*len(kept))
+	for _, line := range kept {
+		out = append(out, line...)
+		out = append(out, '\n')
+	}
+	tmp := p.poolPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return 0
+	}
+	if err := os.Rename(tmp, p.poolPath); err != nil {
+		return 0
+	}
+	return removed
+}
+
+// purgeProxy permanently deletes an excluded entry: it disappears from the
+// proxy file and, through SaveState (which skips purged entries), from the
+// state file. The in-memory entry stays because items is read concurrently,
+// but it is never selected again and is hidden from the stats.
+func (p *proxyTransports) purgeProxy(proxy *proxyTransport) bool {
+	if p == nil || proxy == nil || proxy.fallback || proxy.direct {
+		return false
+	}
+	if !proxy.purged.CompareAndSwap(false, true) {
+		return false
+	}
+	p.purgedCount.Add(1)
+	p.RemovePoolLines(map[string]struct{}{proxy.name: {}})
+	_ = p.SaveState()
+	return true
+}
+
+// excludedEntries lists the entries in the short-term exclusion (retired, not
+// yet purged, not fallback or direct), oldest exclusion first.
+func (p *proxyTransports) excludedEntries() []*proxyTransport {
+	if p == nil {
+		return nil
+	}
+	out := make([]*proxyTransport, 0, 16)
+	for _, proxy := range p.items {
+		if proxy.retired.Load() && !proxy.purged.Load() && !proxy.fallback && !proxy.direct {
+			out = append(out, proxy)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].retiredAt.Load() < out[j].retiredAt.Load()
+	})
+	return out
+}
+
 func (p *proxyTransports) LoadState() error {
 	if p == nil || p.statePath == "" {
 		return nil
@@ -1185,6 +1340,15 @@ func (p *proxyTransports) LoadState() error {
 		if saved.Retired {
 			proxy.retired.Store(true)
 			proxy.healthy.Store(false)
+			if saved.RetiredAt > 0 {
+				proxy.retiredAt.Store(saved.RetiredAt)
+			} else {
+				// An exclusion restored from an older state file without a
+				// timestamp starts its clock now rather than being purged at
+				// once.
+				proxy.retiredAt.Store(time.Now().UnixNano())
+			}
+			proxy.reviveFails.Store(saved.ReviveFails)
 		}
 	}
 	return nil
@@ -1197,12 +1361,19 @@ func (p *proxyTransports) SaveState() error {
 	}
 	st := poolStateFile{Proxies: make(map[string]proxyPersist, len(p.items))}
 	for _, proxy := range p.items {
+		if proxy.purged.Load() {
+			// Purged entries are gone from the pool file; dropping their state
+			// here keeps the state file from accumulating the dead.
+			continue
+		}
 		st.Proxies[proxy.name] = proxyPersist{
-			LatencyMs:  proxy.latencyMs.Load(),
-			Failures:   proxy.failures.Load(),
-			Rejections: proxy.rejections.Load(),
-			Retired:    proxy.retired.Load(),
-			LastProbe:  proxy.lastProbe.Load(),
+			LatencyMs:   proxy.latencyMs.Load(),
+			Failures:    proxy.failures.Load(),
+			Rejections:  proxy.rejections.Load(),
+			Retired:     proxy.retired.Load(),
+			RetiredAt:   proxy.retiredAt.Load(),
+			ReviveFails: proxy.reviveFails.Load(),
+			LastProbe:   proxy.lastProbe.Load(),
 		}
 	}
 	data, err := json.Marshal(st)
