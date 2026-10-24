@@ -885,12 +885,17 @@ func (p *proxyTransports) checkClaimedProxy(ctx context.Context, proxy *proxyTra
 		proxy.failures.Store(0)
 		result.wasHealthy = proxy.healthy.Swap(true)
 	} else if !errors.Is(err, context.Canceled) {
-		// Any non-cancellation error means the probe could not be served
-		// through this proxy: CONNECT refused (e.g. the provider's "Not Enough
-		// Bandwidth"), tunnel failure, reset or timeout. Treat it as a proxy
-		// failure so dead proxies are disabled and eventually retired. The
-		// earlier behavior only counted timeouts/refusals, so a proxy whose
-		// CONNECT is rejected for any other reason stayed "healthy" forever.
+		// A probe is a plain HTTP GET issued *through* the proxy. If it did not
+		// return a response, this proxy cannot currently serve traffic — the
+		// CONNECT was refused, the tunnel broke, the connection was reset, or it
+		// timed out. Every such outcome must count as a failure.
+		//
+		// isProxyFailure() only recognized timeouts and ECONNREFUSED, so a proxy
+		// whose CONNECT is rejected for any other reason (a provider refusing
+		// with its own error, e.g. an exhausted-bandwidth response) was reported
+		// as "inconclusive". It then stayed healthy forever: never taken out of
+		// rotation, never re-bound for key traffic. Only cancellation is exempt,
+		// because that says the *caller* gave up, not that the proxy is down.
 		result.failed = true
 		failures := proxy.failures.Add(1)
 		// Fallback entries (e.g. bridge ports for paid nodes) are never retired:

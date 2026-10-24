@@ -112,8 +112,12 @@ func (a *Server) staticHandler() http.Handler {
 				r.URL.Path = "/"
 			}
 		}
-		// The UI is embedded in the binary and changes only on rebuild; force
-		// revalidation so a rebuilt binary's assets are never served stale.
+		// The UI ships inside the binary and only changes when the binary does,
+		// so a browser that cached app.js/styles.css under a heuristic freshness
+		// lifetime keeps running the previous build's frontend against the new
+		// backend — the UI then shows stale pages (or breaks outright) until the
+		// cache happens to expire or the operator hard-refreshes. Force
+		// revalidation instead.
 		w.Header().Set("Cache-Control", "no-cache")
 		files.ServeHTTP(w, r)
 	})
